@@ -133,6 +133,24 @@ function usesBundledFirefox(target) {
   return target.browser === 'firefox' && readBoolean('FIREFOX_USE_PLAYWRIGHT_BUNDLED', true);
 }
 
+async function closeWithTimeout(label, closeFn) {
+  const timeoutMs = Number(process.env.BROWSER_CLOSE_TIMEOUT_MS || 5000);
+  let timeout;
+
+  try {
+    await Promise.race([
+      closeFn(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} close timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    console.warn(`Warning: ${error.message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function getFingerprint(page) {
   return page.evaluate(() => {
     const data = window.FingerprintData;
@@ -710,9 +728,9 @@ async function runTarget(target, config) {
       results,
     };
     saveJson(path.join(outputDir, 'summary-report.json'), summary);
-    if (page && !page.isClosed()) await page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
-    if (browser) await browser.close().catch(() => {});
+    if (page && !page.isClosed()) await closeWithTimeout('Page', () => page.close());
+    if (context) await closeWithTimeout('Browser context', () => context.close());
+    if (browser) await closeWithTimeout('Browser', () => browser.close());
     return { metadata, results, consoleFile };
   }
 }
