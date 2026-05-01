@@ -1,0 +1,22 @@
+# Browser executable paths used by index.js.
+# Copy this file to browser-paths.properties and update paths for your machine.
+# On Windows, browser-installer/download-browsers.ps1 refreshes managed browser
+# paths automatically unless you pass -NoBrowserPaths.
+# Multiple candidates per key can be separated with semicolons.
+# Windows environment variables in %VAR% form are expanded automatically.
+
+# --- Windows examples ---
+opera=%LOCALAPPDATA%\Programs\Opera\opera.exe
+comet=%LOCALAPPDATA%\Perplexity\Comet\Application\comet.exe
+duckduckgo=%LOCALAPPDATA%\Microsoft\WindowsApps\DuckDuckGo.exe
+
+# --- macOS examples (uncomment if on Mac) ---
+# opera=/Applications/Opera.app/Contents/MacOS/Opera
+# comet=/Applications/Comet.app/Contents/MacOS/Comet
+# duckduckgo=/Applications/DuckDuckGo.app/Contents/MacOS/DuckDuckGo
+# atlas=/Applications/ChatGPT Atlas.app/Contents/MacOS/ChatGPT Atlas;/Applications/Atlas.app/Contents/MacOS/Atlas
+
+# --- Notes ---
+# safari/webkit: use --browser webkit; no path needed, Playwright bundles a WebKit engine.
+# safari on macOS only: use --browser safari (requires Safari Technology Preview or system Safari).
+# atlas: ChatGPT Atlas is currently macOS-only.

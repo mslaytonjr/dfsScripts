@@ -1,0 +1,18 @@
+node_modules/
+
+# browser profiles written by persistent-context runs
+.profiles/
+
+# test output (screenshots, run results)
+artifacts/
+evidence/
+
+# local machine browser paths — copy browser-paths.properties.example instead
+browser-paths.properties
+
+# temp session notes
+SESSION_NOTES.md
+
+# OS junk
+.DS_Store
+Thumbs.db

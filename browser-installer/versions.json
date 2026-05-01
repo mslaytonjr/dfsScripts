@@ -1,0 +1,77 @@
+{
+  "_comment": "Edit this file to change which browser versions get downloaded. Run download-browsers.ps1 (Windows) or download-browsers.sh (Mac) after editing.",
+  "_format": {
+    "chrome":  "Official Chrome for Testing version from Google, e.g. 148.0.7778.97 - verify at https://googlechromelabs.github.io/chrome-for-testing/",
+    "firefox": "Firefox release version, e.g. 138.0 or 138.0.1",
+    "edge":    "Derived from chrome versions through _chromium_alignment.edge because Edge shares Chromium by major version, not exact full Chromium version.",
+    "opera":   "Derived from chrome versions through _chromium_alignment.opera because Opera shares Chromium by major version, not exact full Chromium version.",
+    "brave":   "Brave app version (without leading v), e.g. 1.66.115 - verify at https://github.com/brave/brave-browser/releases"
+  },
+  "_chromium_alignment": {
+    "note": "Chrome uses official Chrome for Testing versions. Edge and Opera use vendor browser versions aligned to the same Chromium major milestones.",
+    "edge": {
+      "140": "140.0.3485.94",
+      "141": "141.0.3537.99",
+      "142": "142.0.3595.94",
+      "143": "143.0.3650.139",
+      "144": "144.0.3719.115",
+      "145": "145.0.3800.97",
+      "146": "146.0.3856.109",
+      "147": "147.0.3912.98"
+    },
+    "opera": {
+      "140": "124.0.5705.65",
+      "141": "125.0.5729.15",
+      "142": "126.0.5750.124",
+      "143": "127.0.5778.47",
+      "144": "128.0.5807.77",
+      "145": "129.0.5823.44",
+      "146": "130.0.5847.82",
+      "147": "131.0.5877.5"
+    }
+  },
+  "_system_only": {
+    "note":       "These browsers have no public version archive; run them via browser-paths.properties as system installs.",
+    "comet":      "Perplexity Comet — Chromium-based, auto-updates, no downloadable archive",
+    "duckduckgo": "DuckDuckGo Browser — Chromium-based, auto-updates, no downloadable archive",
+    "safari":     "macOS only, WebKit engine — use 'webkit' as browser name in index.js for a WebKit-rendered run",
+    "atlas":      "ChatGPT Atlas by OpenAI — macOS-only Chromium-based browser, configure path in browser-paths.properties"
+  },
+  "browsers": {
+    "chrome": [
+      "140.0.7339.186",
+      "141.0.7390.55",
+      "141.1.7390.55",
+      "141.1.7390.108",
+      "142.0.7444.60",
+      "142.0.7444.162",
+      "142.0.7444.168",
+      "142.0.7444.176",
+      "143.0.7499.40",
+      "143.0.7499.110",
+      "143.0.7499.170",
+      "144.0.7559.97",
+      "144.0.7559.110",
+      "145.0.7632.0",
+      "145.0.7632.76",
+      "145.0.7632.110",
+      "145.0.7632.117",
+      "146.0.7680.76",
+      "146.0.7680.80",
+      "146.0.7680.165",
+      "146.0.7680.178",
+      "147.0.7727.24"
+    ],
+    "firefox": [
+      "136.0",
+      "137.0",
+      "138.0"
+    ],
+    "edge": [],
+    "opera": [],
+    "brave": [
+      "1.66.115",
+      "1.73.97"
+    ]
+  }
+}
