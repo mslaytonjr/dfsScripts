@@ -133,6 +133,10 @@ function usesBundledFirefox(target) {
   return target.browser === 'firefox' && readBoolean('FIREFOX_USE_PLAYWRIGHT_BUNDLED', true);
 }
 
+function isUnsupportedAutomationTarget(target) {
+  return target.browser === 'duckduckgo';
+}
+
 async function closeWithTimeout(label, closeFn) {
   const timeoutMs = Number(process.env.BROWSER_CLOSE_TIMEOUT_MS || 5000);
   let timeout;
@@ -430,6 +434,36 @@ async function runTarget(target, config) {
     startedAt: new Date().toISOString(),
   };
 
+  if (isUnsupportedAutomationTarget(target)) {
+    metadata.launchMode = 'manual-validation-required';
+    metadata.finishedAt = new Date().toISOString();
+    metadata.actualBrowserVersion = null;
+    addResult(
+      results,
+      'Browser Automation Support',
+      'SKIP',
+      {
+        browser: target.browser,
+        executablePath: target.executablePath,
+        reason: 'DuckDuckGo for Windows is packaged as a Windows app and does not expose a Playwright-controllable Chromium launch surface.',
+        recommendation: 'Run DuckDuckGo validation separately as a manual evidence pass.',
+      },
+      [],
+      ['DuckDuckGo automation is handled outside Playwright.']
+    );
+    saveJson(path.join(outputDir, 'summary-report.json'), {
+      metadata,
+      totals: {
+        passed: 0,
+        failed: 0,
+        skipped: results.length,
+        total: results.length,
+      },
+      results,
+    });
+    return { metadata, results };
+  }
+
   if (!target.exists) {
     addResult(results, 'Browser Executable Exists', 'FAIL', metadata, [], [`Missing executable: ${target.executablePath}`]);
     saveJson(path.join(outputDir, 'summary-report.json'), { metadata, results });
@@ -723,6 +757,7 @@ async function runTarget(target, config) {
       totals: {
         passed: results.filter((result) => result.status === 'PASS').length,
         failed: results.filter((result) => result.status === 'FAIL').length,
+        skipped: results.filter((result) => result.status === 'SKIP').length,
         total: results.length,
       },
       results,
@@ -763,6 +798,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     tests: aggregate.reduce((sum, item) => sum + item.results.length, 0),
     passed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'PASS').length, 0),
     failed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'FAIL').length, 0),
+    skipped: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'SKIP').length, 0),
   };
   const generatedAt = new Date().toISOString();
 
@@ -778,7 +814,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     const cells = allTestNames.map((testName) => {
       const result = resultByName.get(testName);
       if (!result) return '<td class="skip">N/A</td>';
-      const statusClass = result.status === 'PASS' ? 'pass' : 'fail';
+      const statusClass = result.status === 'PASS' ? 'pass' : result.status === 'FAIL' ? 'fail' : 'skip';
       const title = result.errors && result.errors.length > 0 ? ` title="${escapeHtml(result.errors.join('; '))}"` : '';
       return `<td class="${statusClass}"${title}>${escapeHtml(result.status)}</td>`;
     }).join('');
@@ -814,7 +850,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     th { background: #f0f4f8; text-align: left; position: sticky; top: 0; }
     .pass { background: #e3fcef; color: #0f5132; font-weight: bold; }
     .fail { background: #ffe3e3; color: #842029; font-weight: bold; }
-    .skip { background: #f7f7f7; color: #697386; }
+    .skip { background: #f7f7f7; color: #697386; font-weight: bold; }
     a { color: #0b5cab; }
   </style>
 </head>
@@ -829,6 +865,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     <div class="total"><strong>${totals.tests}</strong> Tests</div>
     <div class="total"><strong>${totals.passed}</strong> Passed</div>
     <div class="total"><strong>${totals.failed}</strong> Failed</div>
+    <div class="total"><strong>${totals.skipped}</strong> Skipped</div>
   </div>
   <table>
     <thead>
@@ -877,7 +914,8 @@ async function main() {
     const result = await runTarget(target, { targetUrl });
     const failed = result.results.filter((test) => test.status === 'FAIL').length;
     const passed = result.results.filter((test) => test.status === 'PASS').length;
-    console.log(`  ${passed}/${result.results.length} passed, ${failed} failed`);
+    const skipped = result.results.filter((test) => test.status === 'SKIP').length;
+    console.log(`  ${passed}/${result.results.length} passed, ${failed} failed, ${skipped} skipped`);
     aggregate.push(result);
   }
 
@@ -892,6 +930,7 @@ async function main() {
       tests: aggregate.reduce((sum, item) => sum + item.results.length, 0),
       passed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'PASS').length, 0),
       failed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'FAIL').length, 0),
+      skipped: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'SKIP').length, 0),
     },
     runs: aggregate.map((item) => ({
       metadata: item.metadata,
