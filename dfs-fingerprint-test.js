@@ -139,17 +139,21 @@ function isUnsupportedAutomationTarget(target) {
 
 async function closeWithTimeout(label, closeFn) {
   const timeoutMs = Number(process.env.BROWSER_CLOSE_TIMEOUT_MS || 5000);
+  await runWithTimeout(`${label} close`, timeoutMs, closeFn).catch((error) => {
+    console.warn(`Warning: ${error.message}`);
+  });
+}
+
+async function runWithTimeout(label, timeoutMs, action) {
   let timeout;
 
   try {
-    await Promise.race([
-      closeFn(),
+    return await Promise.race([
+      action(),
       new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`${label} close timed out after ${timeoutMs}ms`)), timeoutMs);
+        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
       }),
     ]);
-  } catch (error) {
-    console.warn(`Warning: ${error.message}`);
   } finally {
     clearTimeout(timeout);
   }
@@ -179,6 +183,46 @@ async function getFingerprint(page) {
 
 async function getDfsCookies(page) {
   return page.evaluate(() => document.cookie.split(';').map((cookie) => cookie.trim()).filter((cookie) => cookie.startsWith('dfs_')));
+}
+
+async function getBrowserFailureDiagnostics(page) {
+  return page.evaluate(async () => {
+    async function readExpression(expression, getter) {
+      try {
+        return {
+          expression,
+          value: await getter(),
+        };
+      } catch (error) {
+        return {
+          expression,
+          error: error.message,
+        };
+      }
+    }
+
+    const highEntropyHints = ['fullVersionList', 'platform', 'platformVersion', 'architecture', 'bitness', 'model'];
+
+    return {
+      capturedAt: new Date().toISOString(),
+      values: [
+        await readExpression(
+          'navigator.userAgentData.getHighEntropyValues(["fullVersionList", "platform", "platformVersion", "architecture", "bitness", "model"])',
+          () => navigator.userAgentData.getHighEntropyValues(highEntropyHints)
+        ),
+        await readExpression('navigator.userAgent', () => navigator.userAgent),
+        await readExpression('navigator.language', () => navigator.language),
+        await readExpression('Intl.DateTimeFormat().resolvedOptions().timeZone', () => Intl.DateTimeFormat().resolvedOptions().timeZone),
+        await readExpression('navigator.platform', () => navigator.platform),
+        await readExpression(
+          "performance.getEntriesByType('resource').filter(r=> /sentry|boomr|akamai/i.test(r.name))",
+          () => performance.getEntriesByType('resource')
+            .filter((entry) => /sentry|boomr|akamai/i.test(entry.name))
+            .map((entry) => entry.toJSON())
+        ),
+      ],
+    };
+  });
 }
 
 function parseCookieArray(cookieArray) {
@@ -276,6 +320,97 @@ function matcherFromConfig(value) {
   return (url) => url.includes(value);
 }
 
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(value);
+}
+
+function isDfsJsUrl(value) {
+  try {
+    return new URL(value).pathname.toLowerCase().endsWith('dfs.js');
+  } catch {
+    return false;
+  }
+}
+
+async function loadScriptOverrideSource(context, source) {
+  if (isHttpUrl(source)) {
+    const response = await context.request.get(source, {
+      timeout: Number(process.env.SCRIPT_OVERRIDE_FETCH_TIMEOUT_MS || 30000),
+    });
+    if (!response.ok()) {
+      throw new Error(`Script override source returned HTTP ${response.status()}: ${source}`);
+    }
+
+    return {
+      sourceType: 'url',
+      source,
+      body: await response.body(),
+      contentType: response.headers()['content-type'] || 'application/javascript',
+    };
+  }
+
+  const filePath = path.isAbsolute(source) ? source : path.join(ROOT_DIR, source);
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Script override source file does not exist: ${filePath}`);
+  }
+  if (!fs.statSync(filePath).isFile()) {
+    throw new Error(`Script override source must be a JavaScript file, but this path is not a file: ${filePath}`);
+  }
+
+  return {
+    sourceType: 'file',
+    source: filePath,
+    body: fs.readFileSync(filePath),
+    contentType: 'application/javascript',
+  };
+}
+
+async function installScriptOverride(context, outputDir) {
+  const match = readString('SCRIPT_OVERRIDE_MATCH');
+  const source = readString('SCRIPT_OVERRIDE_SOURCE');
+  if (!match && !source) return null;
+  if (!match || !source) {
+    throw new Error('SCRIPT_OVERRIDE_MATCH and SCRIPT_OVERRIDE_SOURCE must both be configured to override a script.');
+  }
+
+  const matches = matcherFromConfig(match);
+  const replacement = await loadScriptOverrideSource(context, source);
+  const details = {
+    enabled: true,
+    match,
+    sourceType: replacement.sourceType,
+    source: replacement.source,
+    contentType: replacement.contentType,
+    found: false,
+    matchedRequests: [],
+  };
+
+  await context.route('**/*', async (route) => {
+    const request = route.request();
+    if (!matches(request.url())) {
+      await route.continue();
+      return;
+    }
+
+    details.matchedRequests.push({
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      timestamp: new Date().toISOString(),
+    });
+    details.found = true;
+
+    await route.fulfill({
+      status: 200,
+      contentType: replacement.contentType,
+      body: replacement.body,
+    });
+  });
+
+  saveJson(path.join(outputDir, 'script-override.json'), details);
+  return details;
+}
+
 async function waitForLoginRequest(page, matcher) {
   const matches = matcherFromConfig(matcher);
   return page.waitForRequest((request) => matches(request.url()), {
@@ -313,7 +448,14 @@ function addResult(results, testName, status, details, evidenceFilePaths = [], e
 }
 
 function requiredCookieFailures(cookieMap) {
-  return REQUIRED_DFS_COOKIES.filter((key) => !cookieMap[key]);
+  const ignoredCookies = new Set(
+    readString('IGNORE_REQUIRED_DFS_COOKIES')
+      .split(',')
+      .map((key) => key.trim())
+      .filter(Boolean)
+  );
+
+  return REQUIRED_DFS_COOKIES.filter((key) => !ignoredCookies.has(key) && !cookieMap[key]);
 }
 
 function extractFingerprintValues(fingerprint) {
@@ -371,6 +513,38 @@ function readString(name, defaultValue = '') {
   return value === undefined || value === '' ? defaultValue : value;
 }
 
+function shouldTestLogon() {
+  if (process.env.TEST_LOGON !== undefined && process.env.TEST_LOGON !== '') {
+    return readBoolean('TEST_LOGON', false);
+  }
+  return readBoolean('SUBMIT_CREDENTIALS', false);
+}
+
+function getLogonSkipReason() {
+  if (!shouldTestLogon()) {
+    return {
+      reason: 'Logon validation is disabled.',
+      errors: ['Set TEST_LOGON=true to run the logon submission validation.'],
+    };
+  }
+
+  const missing = [
+    ['USERNAME_SELECTOR', process.env.USERNAME_SELECTOR],
+    ['PASSWORD_SELECTOR', process.env.PASSWORD_SELECTOR],
+  ].filter(([, value]) => value === undefined || value.trim() === '');
+
+  if (missing.length > 0) {
+    const missingNames = missing.map(([name]) => name);
+    return {
+      reason: 'Logon validation is enabled, but required selector configuration is missing.',
+      missing: missingNames,
+      errors: [`Missing required logon selector(s): ${missingNames.join(', ')}`],
+    };
+  }
+
+  return null;
+}
+
 async function maybeMoveMouse(page) {
   const viewport = page.viewportSize() || { width: 1280, height: 720 };
   const points = [
@@ -413,15 +587,138 @@ function getReleaseVersion() {
   return process.env.RELEASE_VERSION || process.env.RELEASEVERSION || process.env.EXPECTED_DFS_E_8 || 'unversioned';
 }
 
-let currentRun = { outputDir: ROOT_DIR };
+function requireHttpsUrl(value) {
+  let parsed;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`TARGET_URL must be a valid HTTPS URL. Got: ${value}`);
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`TARGET_URL must use HTTPS. Got: ${value}`);
+  }
+
+  return parsed.toString();
+}
+
+function getNextEvidenceDir(releaseVersion) {
+  const baseDir = path.join(ROOT_DIR, 'evidence', sanitizeSegment(releaseVersion));
+  if (!fs.existsSync(baseDir)) return baseDir;
+
+  let index = 1;
+  while (fs.existsSync(path.join(baseDir, `test-${index}`))) {
+    index += 1;
+  }
+
+  return path.join(baseDir, `test-${index}`);
+}
+
+let currentRun = { outputDir: ROOT_DIR, steps: [], currentStep: null };
+
+function writeRunProgress() {
+  if (!currentRun.outputDir) return;
+
+  const progressPath = path.join(currentRun.outputDir, 'test-progress.json');
+  const currentStep = currentRun.currentStep
+    ? {
+        ...currentRun.currentStep,
+        elapsedMs: Date.now() - currentRun.currentStep.startedAtMs,
+      }
+    : null;
+
+  fs.mkdirSync(path.dirname(progressPath), { recursive: true });
+  fs.writeFileSync(
+    progressPath,
+    `${JSON.stringify(
+      {
+        updatedAt: new Date().toISOString(),
+        currentStep,
+        steps: currentRun.steps,
+      },
+      null,
+      2
+    )}\n`,
+    'utf8'
+  );
+}
+
+async function runStep(label, action) {
+  const traceSteps = readBoolean('TRACE_STEPS', true);
+  const stallLogMs = Number(process.env.STEP_STALL_LOG_MS || 10000);
+  const stepTimeoutMs = Number(process.env.STEP_TIMEOUT_MS || 60000);
+  const step = {
+    label,
+    status: 'waiting',
+    startedAt: new Date().toISOString(),
+    startedAtMs: Date.now(),
+  };
+  let heartbeat;
+
+  currentRun.currentStep = step;
+  if (traceSteps) console.log(`    waiting: ${label}`);
+  writeRunProgress();
+
+  if (traceSteps && stallLogMs > 0) {
+    heartbeat = setInterval(() => {
+      const elapsedMs = Date.now() - step.startedAtMs;
+      console.log(`    still waiting after ${elapsedMs}ms: ${label}`);
+      writeRunProgress();
+    }, stallLogMs);
+    heartbeat.unref();
+  }
+
+  try {
+    const actionPromise = Promise.resolve().then(action);
+    actionPromise.catch(() => {});
+    let stepTimeout;
+
+    const result = stepTimeoutMs > 0
+      ? await Promise.race([
+          actionPromise,
+          new Promise((_, reject) => {
+            stepTimeout = setTimeout(() => reject(new Error(`${label} timed out after ${stepTimeoutMs}ms`)), stepTimeoutMs);
+          }),
+        ]).finally(() => clearTimeout(stepTimeout))
+      : await actionPromise;
+    const completedStep = {
+      label,
+      status: 'complete',
+      startedAt: step.startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - step.startedAtMs,
+    };
+    currentRun.steps.push(completedStep);
+    if (traceSteps) console.log(`    complete: ${label} (${completedStep.durationMs}ms)`);
+    return result;
+  } catch (error) {
+    const failedStep = {
+      label,
+      status: 'error',
+      startedAt: step.startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - step.startedAtMs,
+      error: error.message,
+    };
+    currentRun.steps.push(failedStep);
+    if (traceSteps) console.log(`    error: ${label} (${failedStep.durationMs}ms): ${error.message}`);
+    throw error;
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    currentRun.currentStep = null;
+    writeRunProgress();
+  }
+}
 
 async function runTarget(target, config) {
   const results = [];
   const consoleMessages = [];
+  const dfsJsFiles = [];
   const releaseVersion = getReleaseVersion();
   const browserVersion = target.configuredVersion;
-  const outputDir = path.join(ROOT_DIR, 'evidence', sanitizeSegment(releaseVersion), sanitizeSegment(target.browser), sanitizeSegment(browserVersion));
-  currentRun = { outputDir };
+  const outputDir = path.join(config.releaseDir, sanitizeSegment(target.browser), sanitizeSegment(browserVersion));
+  currentRun = { outputDir, steps: [], currentStep: null };
   fs.mkdirSync(path.join(outputDir, 'screenshots'), { recursive: true });
 
   const metadata = {
@@ -479,17 +776,19 @@ async function runTarget(target, config) {
   let initialCookieMap = {};
   let initialDfsF1 = undefined;
   let initialDfsF2 = undefined;
+  let scriptOverride = null;
 
   try {
-    browser = await browserType.launch(getLaunchOptions(target));
+    browser = await runStep('launch browser', () => browserType.launch(getLaunchOptions(target)));
 
-    context = await browser.newContext({
+    context = await runStep('create browser context', () => browser.newContext({
       viewport: {
         width: Number(process.env.VIEWPORT_WIDTH || 1365),
         height: Number(process.env.VIEWPORT_HEIGHT || 900),
       },
-    });
-    page = await context.newPage();
+    }));
+    scriptOverride = await runStep('install script override', () => installScriptOverride(context, outputDir));
+    page = await runStep('open new page', () => context.newPage());
     page.on('console', (message) => {
       if (message.type() === 'warning' || message.type() === 'error') {
         consoleMessages.push({
@@ -508,16 +807,27 @@ async function runTarget(target, config) {
         timestamp: new Date().toISOString(),
       });
     });
+    page.on('request', (request) => {
+      const url = request.url();
+      if (!isDfsJsUrl(url)) return;
 
-    await page.goto(config.targetUrl, {
+      dfsJsFiles.push({
+        url,
+        method: request.method(),
+        resourceType: request.resourceType(),
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    await runStep(`navigate to ${config.targetUrl}`, () => page.goto(config.targetUrl, {
       waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
       timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
-    });
-    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+    }));
+    await runStep('post-load wait', () => page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
 
-    const screenshotInitial = await saveScreenshot(page, 'initial-page');
-    initialFingerprint = await getFingerprint(page);
-    const initialCookies = await getDfsCookies(page);
+    const screenshotInitial = await runStep('save initial-page screenshot', () => saveScreenshot(page, 'initial-page'));
+    initialFingerprint = await runStep('read initial fingerprint', () => getFingerprint(page));
+    const initialCookies = await runStep('read initial DFS cookies', () => getDfsCookies(page));
     initialCookieMap = parseCookieArray(initialCookies);
     initialDfsF1 = getFingerprintValue(initialFingerprint, 'dfs_F_1');
     initialDfsF2 = getFingerprintValue(initialFingerprint, 'dfs_F_2');
@@ -555,7 +865,7 @@ async function runTarget(target, config) {
 
     const browserDetection = {
       browser: target.browser,
-      userAgent: await page.evaluate(() => navigator.userAgent),
+      userAgent: await runStep('read user agent', () => page.evaluate(() => navigator.userAgent)),
       dfs_E_6_cookie: initialCookieMap.dfs_E_6,
       dfs_E_6_fingerprint: getFingerprintValue(initialFingerprint, 'dfs_E_6'),
       expectedValue: getExpectedDfsE6(target.browser),
@@ -586,7 +896,7 @@ async function runTarget(target, config) {
       expectations: {
         bit0: expectedWebdriverBit0,
         bit1: '0',
-        bit16: '0',
+        ...(readBoolean('IGNORE_DFS_E7_BIT16', false) ? {} : { bit16: '0' }),
         bit22: '0',
         bit25: '0',
         bit26: '0',
@@ -631,11 +941,11 @@ async function runTarget(target, config) {
     );
 
     if (readBoolean('PERFORM_MOUSE_MOVEMENT', true)) {
-      await page.waitForTimeout(Number(process.env.MOUSE_WAIT_BEFORE_MS || 15000));
-      await maybeMoveMouse(page);
-      await page.waitForTimeout(Number(process.env.MOUSE_WAIT_AFTER_MS || 1000));
-      const afterMouseScreenshot = await saveScreenshot(page, 'after-mouse');
-      const fingerprintAfterMouse = await getFingerprint(page);
+      await runStep('pre-mouse wait', () => page.waitForTimeout(Number(process.env.MOUSE_WAIT_BEFORE_MS || 15000)));
+      await runStep('perform mouse movement', () => maybeMoveMouse(page));
+      await runStep('post-mouse wait', () => page.waitForTimeout(Number(process.env.MOUSE_WAIT_AFTER_MS || 1000)));
+      const afterMouseScreenshot = await runStep('save after-mouse screenshot', () => saveScreenshot(page, 'after-mouse'));
+      const fingerprintAfterMouse = await runStep('read fingerprint after mouse', () => getFingerprint(page));
       const afterMouseDfsF2 = getFingerprintValue(fingerprintAfterMouse, 'dfs_F_2');
       const afterMouseFile = saveJson(path.join(outputDir, 'fingerprint-after-mouse.json'), fingerprintAfterMouse);
       const mouseComparison = {
@@ -654,9 +964,9 @@ async function runTarget(target, config) {
       );
     }
 
-    await page.reload({ waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded', timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000) });
-    await page.waitForTimeout(Number(process.env.POST_RELOAD_WAIT_MS || 5000));
-    const fingerprintAfterReload = await getFingerprint(page);
+    await runStep('reload page', () => page.reload({ waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded', timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000) }));
+    await runStep('post-reload wait', () => page.waitForTimeout(Number(process.env.POST_RELOAD_WAIT_MS || 5000)));
+    const fingerprintAfterReload = await runStep('read fingerprint after reload', () => getFingerprint(page));
     const afterReloadDfsF1 = getFingerprintValue(fingerprintAfterReload, 'dfs_F_1');
     const afterReloadFile = saveJson(path.join(outputDir, 'fingerprint-after-reload.json'), fingerprintAfterReload);
     const reloadComparison = {
@@ -674,61 +984,94 @@ async function runTarget(target, config) {
       reloadComparison.stable ? [] : ['dfs_F_1 changed after reload']
     );
 
-    if (readBoolean('SUBMIT_CREDENTIALS', false)) {
-      const matcher = process.env.LOGIN_REQUEST_MATCHER || '';
-      const requestPromise = matcher ? waitForLoginRequest(page, matcher).catch((error) => ({ __error: error.message })) : Promise.resolve({ __error: 'LOGIN_REQUEST_MATCHER is not configured' });
-      await fillAndSubmit(page);
-      const loginRequest = await requestPromise;
-      await page.waitForLoadState(process.env.POST_SUBMIT_LOAD_STATE || 'networkidle', { timeout: Number(process.env.POST_SUBMIT_TIMEOUT_MS || 30000) }).catch(() => {});
-      const afterSubmitScreenshot = await saveScreenshot(page, 'after-submit');
-      const afterSubmitCookies = parseCookieArray(await getDfsCookies(page));
-      const afterSubmitFingerprint = await getFingerprint(page);
-      const requestDetails = loginRequest.__error
-        ? { error: loginRequest.__error }
-        : {
-            url: loginRequest.url(),
-            method: loginRequest.method(),
-            headers: loginRequest.headers(),
-            postData: loginRequest.postData(),
-            postDataJSON: loginRequest.postDataJSON ? tryPostDataJson(loginRequest) : null,
-          };
-      const requestFile = saveJson(path.join(outputDir, 'network-login-request.json'), requestDetails);
-      const afterSubmitCookiesFile = saveJson(path.join(outputDir, 'cookies-after-submit.json'), afterSubmitCookies);
-      const afterSubmitFingerprintFile = saveJson(path.join(outputDir, 'fingerprint-after-submit.json'), afterSubmitFingerprint);
-      const afterSubmitComparison = compareCookieToFingerprint(afterSubmitCookies, afterSubmitFingerprint);
-      const expectedTelemetry = flattenDfsBValues(afterSubmitFingerprint);
-      const actualTelemetry = findAuthTelemetry(requestDetails.postDataJSON || requestDetails.postData);
-      const headers = requestDetails.headers || {};
-      const submitValidation = {
-        missingCookies: requiredCookieFailures(afterSubmitCookies),
-        cookieComparison: afterSubmitComparison,
-        auth_fingerprintTelemetry: {
-          actual: actualTelemetry,
-          expectedConcatenatedDfsB: expectedTelemetry,
-          matches: actualTelemetry === undefined || !expectedTelemetry ? null : String(actualTelemetry) === String(expectedTelemetry),
-        },
-        headers: {
-          dfsosbrowser: headers.dfsosbrowser,
-          expectedDfsOsBrowser: afterSubmitCookies.dfs_E_6,
-          dfsagenticscore: headers.dfsagenticscore,
-          expectedDfsAgenticScore: afterSubmitCookies.dfs_E_5,
-        },
-      };
-      const submitComparisonFile = saveJson(path.join(outputDir, 'submit-request-comparison.json'), submitValidation);
-      const submitFailures = [
-        ...submitValidation.missingCookies.map((key) => `Missing or empty cookie after submit: ${key}`),
-        ...(submitValidation.auth_fingerprintTelemetry.matches === false ? ['auth_fingerprintTelemetry does not match concatenated dfs_B* value'] : []),
-        ...(headers.dfsosbrowser && afterSubmitCookies.dfs_E_6 && headers.dfsosbrowser !== afterSubmitCookies.dfs_E_6 ? ['dfsosbrowser header does not match dfs_E_6'] : []),
-        ...(headers.dfsagenticscore && afterSubmitCookies.dfs_E_5 && headers.dfsagenticscore !== afterSubmitCookies.dfs_E_5 ? ['dfsagenticscore header does not match dfs_E_5'] : []),
-        ...(requestDetails.error ? [requestDetails.error] : []),
-      ];
+    const logonSkipReason = getLogonSkipReason();
+    if (!logonSkipReason) {
+      try {
+        const matcher = process.env.LOGIN_REQUEST_MATCHER || '';
+        const requestPromise = matcher ? waitForLoginRequest(page, matcher).catch((error) => ({ __error: error.message })) : Promise.resolve({ __error: 'LOGIN_REQUEST_MATCHER is not configured' });
+        await runStep('fill and submit login form', () => fillAndSubmit(page));
+        const loginRequest = await runStep('wait for login request', () => requestPromise);
+        await runStep('wait for post-submit load state', () => page.waitForLoadState(process.env.POST_SUBMIT_LOAD_STATE || 'networkidle', { timeout: Number(process.env.POST_SUBMIT_TIMEOUT_MS || 30000) }).catch(() => {}));
+        const afterSubmitScreenshot = await runStep('save after-submit screenshot', () => saveScreenshot(page, 'after-submit'));
+        const afterSubmitCookies = parseCookieArray(await runStep('read post-submit DFS cookies', () => getDfsCookies(page)));
+        const afterSubmitFingerprint = await runStep('read post-submit fingerprint', () => getFingerprint(page));
+        const requestDetails = loginRequest.__error
+          ? { error: loginRequest.__error }
+          : {
+              url: loginRequest.url(),
+              method: loginRequest.method(),
+              headers: loginRequest.headers(),
+              postData: loginRequest.postData(),
+              postDataJSON: loginRequest.postDataJSON ? tryPostDataJson(loginRequest) : null,
+            };
+        const requestFile = saveJson(path.join(outputDir, 'network-login-request.json'), requestDetails);
+        const afterSubmitCookiesFile = saveJson(path.join(outputDir, 'cookies-after-submit.json'), afterSubmitCookies);
+        const afterSubmitFingerprintFile = saveJson(path.join(outputDir, 'fingerprint-after-submit.json'), afterSubmitFingerprint);
+        const afterSubmitComparison = compareCookieToFingerprint(afterSubmitCookies, afterSubmitFingerprint);
+        const expectedTelemetry = flattenDfsBValues(afterSubmitFingerprint);
+        const actualTelemetry = findAuthTelemetry(requestDetails.postDataJSON || requestDetails.postData);
+        const headers = requestDetails.headers || {};
+        const submitValidation = {
+          missingCookies: requiredCookieFailures(afterSubmitCookies),
+          cookieComparison: afterSubmitComparison,
+          auth_fingerprintTelemetry: {
+            actual: actualTelemetry,
+            expectedConcatenatedDfsB: expectedTelemetry,
+            matches: actualTelemetry === undefined || !expectedTelemetry ? null : String(actualTelemetry) === String(expectedTelemetry),
+          },
+          headers: {
+            dfsosbrowser: headers.dfsosbrowser,
+            expectedDfsOsBrowser: afterSubmitCookies.dfs_E_6,
+            dfsagenticscore: headers.dfsagenticscore,
+            expectedDfsAgenticScore: afterSubmitCookies.dfs_E_5,
+          },
+        };
+        const submitComparisonFile = saveJson(path.join(outputDir, 'submit-request-comparison.json'), submitValidation);
+        const submitFailures = [
+          ...submitValidation.missingCookies.map((key) => `Missing or empty cookie after submit: ${key}`),
+          ...(submitValidation.auth_fingerprintTelemetry.matches === false ? ['auth_fingerprintTelemetry does not match concatenated dfs_B* value'] : []),
+          ...(headers.dfsosbrowser && afterSubmitCookies.dfs_E_6 && headers.dfsosbrowser !== afterSubmitCookies.dfs_E_6 ? ['dfsosbrowser header does not match dfs_E_6'] : []),
+          ...(headers.dfsagenticscore && afterSubmitCookies.dfs_E_5 && headers.dfsagenticscore !== afterSubmitCookies.dfs_E_5 ? ['dfsagenticscore header does not match dfs_E_5'] : []),
+          ...(requestDetails.error ? [requestDetails.error] : []),
+        ];
+        addResult(
+          results,
+          'Cookies and Payload After Form Submission',
+          submitFailures.length === 0 ? 'PASS' : 'FAIL',
+          submitValidation,
+          [afterSubmitScreenshot, requestFile, afterSubmitCookiesFile, afterSubmitFingerprintFile, submitComparisonFile],
+          submitFailures
+        );
+      } catch (error) {
+        addResult(
+          results,
+          'Cookies and Payload After Form Submission',
+          'FAIL',
+          {
+            reason: 'Logon validation failed before post-submit evidence could be collected.',
+            usernameSelector: process.env.USERNAME_SELECTOR,
+            passwordSelector: process.env.PASSWORD_SELECTOR,
+            submitSelector: process.env.SUBMIT_SELECTOR,
+            error: error.message,
+          },
+          [],
+          [error.message]
+        );
+      }
+    } else {
       addResult(
         results,
         'Cookies and Payload After Form Submission',
-        submitFailures.length === 0 ? 'PASS' : 'FAIL',
-        submitValidation,
-        [afterSubmitScreenshot, requestFile, afterSubmitCookiesFile, afterSubmitFingerprintFile, submitComparisonFile],
-        submitFailures
+        'SKIP',
+        {
+          reason: logonSkipReason.reason,
+          flag: 'TEST_LOGON',
+          enabledValue: 'true',
+          compatibilityFlag: 'SUBMIT_CREDENTIALS',
+          ...(logonSkipReason.missing ? { missing: logonSkipReason.missing } : {}),
+        },
+        [],
+        logonSkipReason.errors
       );
     }
 
@@ -749,7 +1092,44 @@ async function runTarget(target, config) {
   } catch (error) {
     addResult(results, 'Unhandled Browser Run Error', 'FAIL', metadata, [], [error]);
   } finally {
+    if (scriptOverride) {
+      saveJson(path.join(outputDir, 'script-override.json'), scriptOverride);
+      metadata.scriptOverride = {
+        match: scriptOverride.match,
+        sourceType: scriptOverride.sourceType,
+        source: scriptOverride.source,
+        found: scriptOverride.found,
+        matchedRequests: scriptOverride.matchedRequests.length,
+      };
+    }
+
     const consoleFile = saveJson(path.join(outputDir, 'console-log.json'), consoleMessages);
+    saveJson(path.join(outputDir, 'dfs-js-files.json'), {
+      found: dfsJsFiles.length > 0,
+      count: dfsJsFiles.length,
+      files: dfsJsFiles,
+    });
+    const hasFailures = results.some((result) => result.status === 'FAIL');
+    let browserFailureDiagnosticsFile = null;
+
+    if (hasFailures && page && !page.isClosed()) {
+      const diagnostics = await runWithTimeout(
+        'Browser failure diagnostics',
+        Number(process.env.BROWSER_DIAGNOSTICS_TIMEOUT_MS || 5000),
+        () => getBrowserFailureDiagnostics(page)
+      ).catch((error) => ({
+        capturedAt: new Date().toISOString(),
+        error: error.message,
+        values: [],
+      }));
+      if (diagnostics) {
+        browserFailureDiagnosticsFile = saveJson(path.join(outputDir, 'browser-failure-diagnostics.json'), diagnostics);
+        for (const result of results.filter((item) => item.status === 'FAIL')) {
+          result.evidenceFilePaths.push(browserFailureDiagnosticsFile);
+        }
+      }
+    }
+
     metadata.finishedAt = new Date().toISOString();
     metadata.actualBrowserVersion = browser ? browser.version() : null;
     const summary = {
@@ -791,6 +1171,23 @@ function relativeLink(fromDir, toPath) {
   return path.relative(fromDir, toPath).replace(/\\/g, '/');
 }
 
+function getResultReason(result) {
+  if (result.details && typeof result.details === 'object' && result.details.reason) {
+    return result.details.reason;
+  }
+  if (result.errors && result.errors.length > 0) {
+    return result.errors[0];
+  }
+  return '';
+}
+
+function getCoverStatusText(result) {
+  if (result.status !== 'FAIL') return result.status;
+
+  const reason = getResultReason(result);
+  return reason ? `${result.status} - ${reason}` : result.status;
+}
+
 function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
   const allTestNames = [...new Set(aggregate.flatMap((item) => item.results.map((result) => result.testName)))];
   const totals = {
@@ -816,7 +1213,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
       if (!result) return '<td class="skip">N/A</td>';
       const statusClass = result.status === 'PASS' ? 'pass' : result.status === 'FAIL' ? 'fail' : 'skip';
       const title = result.errors && result.errors.length > 0 ? ` title="${escapeHtml(result.errors.join('; '))}"` : '';
-      return `<td class="${statusClass}"${title}>${escapeHtml(result.status)}</td>`;
+      return `<td class="${statusClass}"${title}>${escapeHtml(getCoverStatusText(result))}</td>`;
     }).join('');
 
     return `
@@ -891,10 +1288,11 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
 
 async function main() {
   loadEnvFile(process.env.DFS_ENV_FILE || DEFAULT_ENV_FILE);
-  const targetUrl = process.env.TARGET_URL;
+  let targetUrl = process.env.TARGET_URL;
   if (!targetUrl) {
     throw new Error('TARGET_URL is required. Set it in .env or the environment.');
   }
+  targetUrl = requireHttpsUrl(targetUrl);
 
   const selectedBrowsers = (process.env.BROWSERS || '')
     .split(',')
@@ -907,11 +1305,15 @@ async function main() {
     throw new Error(`No browser executable paths found in ${BROWSER_PATHS_FILE}.`);
   }
 
+  const releaseVersion = getReleaseVersion();
+  const releaseDir = getNextEvidenceDir(releaseVersion);
+  console.log(`Evidence directory: ${releaseDir}`);
+
   const aggregate = [];
   for (const target of targets) {
     const launchNote = usesBundledFirefox(target) ? ' using Playwright bundled Firefox' : '';
     console.log(`Running ${target.browser} ${target.configuredVersion}: ${target.executablePath}${launchNote}`);
-    const result = await runTarget(target, { targetUrl });
+    const result = await runTarget(target, { targetUrl, releaseDir });
     const failed = result.results.filter((test) => test.status === 'FAIL').length;
     const passed = result.results.filter((test) => test.status === 'PASS').length;
     const skipped = result.results.filter((test) => test.status === 'SKIP').length;
@@ -919,8 +1321,6 @@ async function main() {
     aggregate.push(result);
   }
 
-  const releaseVersion = getReleaseVersion();
-  const releaseDir = path.join(ROOT_DIR, 'evidence', sanitizeSegment(releaseVersion));
   const aggregatePath = path.join(releaseDir, 'summary-report.json');
   saveJson(aggregatePath, {
     releaseVersion,
