@@ -118,7 +118,7 @@ function getBrowserType(browser) {
 
 function getLaunchOptions(target) {
   const options = {
-    headless: readBoolean('HEADLESS', false),
+    headless: readBoolean('HEADLESS', true),
   };
 
   if (target.browser === 'firefox' && readBoolean('FIREFOX_USE_PLAYWRIGHT_BUNDLED', true)) {
@@ -183,6 +183,10 @@ async function getFingerprint(page) {
 
 async function getDfsCookies(page) {
   return page.evaluate(() => document.cookie.split(';').map((cookie) => cookie.trim()).filter((cookie) => cookie.startsWith('dfs_')));
+}
+
+async function getDfsE5DebugLog(page) {
+  return page.evaluate(() => Array.isArray(window.__DFS_E5_DEBUG_LOG) ? window.__DFS_E5_DEBUG_LOG : []);
 }
 
 async function getBrowserFailureDiagnostics(page) {
@@ -513,6 +517,49 @@ function readString(name, defaultValue = '') {
   return value === undefined || value === '' ? defaultValue : value;
 }
 
+function parseList(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getLobs() {
+  return parseList(process.env.LOBS);
+}
+
+function getLobEnvPrefixes(lob) {
+  const raw = String(lob || '').trim();
+  const upper = raw.toUpperCase();
+  return [`${raw}.`, `${upper}.`];
+}
+
+async function withLobEnvironment(lob, action) {
+  if (!lob) return action();
+
+  const originalEnv = { ...process.env };
+  const prefixes = getLobEnvPrefixes(lob);
+
+  try {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      const prefix = prefixes.find((candidate) => key.startsWith(candidate));
+      if (!prefix) continue;
+
+      const unprefixedKey = key.slice(prefix.length);
+      if (unprefixedKey) process.env[unprefixedKey] = value;
+    }
+
+    return await action();
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    for (const [key, value] of Object.entries(originalEnv)) {
+      process.env[key] = value;
+    }
+  }
+}
+
 function shouldTestLogon() {
   if (process.env.TEST_LOGON !== undefined && process.env.TEST_LOGON !== '') {
     return readBoolean('TEST_LOGON', false);
@@ -545,6 +592,14 @@ function getLogonSkipReason() {
   return null;
 }
 
+async function waitForCookieSettle(page, phase) {
+  const phaseKey = `${phase.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_COOKIE_WAIT_MS`;
+  const waitMs = Number(process.env[phaseKey] || process.env.COOKIE_SETTLE_WAIT_MS || 0);
+  if (waitMs > 0) {
+    await page.waitForTimeout(waitMs);
+  }
+}
+
 async function maybeMoveMouse(page) {
   const viewport = page.viewportSize() || { width: 1280, height: 720 };
   const points = [
@@ -560,26 +615,340 @@ async function maybeMoveMouse(page) {
   }
 }
 
+function frameNameFromSelector(selector) {
+  const match = String(selector || '').match(/\bname\s*=\s*["']([^"']+)["']/i);
+  return match ? match[1] : '';
+}
+
+function getLoginFrame(page) {
+  const frameName = process.env.LOGIN_FRAME_NAME || frameNameFromSelector(process.env.LOGIN_FRAME_SELECTOR);
+  const frameUrlMatcher = process.env.LOGIN_FRAME_URL_MATCHER;
+  const frames = page.frames();
+
+  if (frameName) {
+    const namedFrame = frames.find((frame) => frame.name() === frameName);
+    if (namedFrame) return namedFrame;
+  }
+
+  if (frameUrlMatcher) {
+    const matches = matcherFromConfig(frameUrlMatcher);
+    const urlFrame = frames.find((frame) => matches(frame.url()));
+    if (urlFrame) return urlFrame;
+  }
+
+  return null;
+}
+
 async function fillAndSubmit(page) {
+  const frameSelector = process.env.LOGIN_FRAME_SELECTOR;
   const usernameSelector = process.env.USERNAME_SELECTOR;
   const passwordSelector = process.env.PASSWORD_SELECTOR;
   const submitSelector = process.env.SUBMIT_SELECTOR;
   const username = process.env.LOGIN_USERNAME;
   const password = process.env.LOGIN_PASSWORD;
+  const usernameDelayMs = Number(process.env.USERNAME_TYPE_DELAY_MS || process.env.TYPE_DELAY_MS || 45);
+  const passwordDelayMs = Number(process.env.PASSWORD_TYPE_DELAY_MS || process.env.TYPE_DELAY_MS || 55);
+  const beforeSubmitWaitMs = Number(process.env.BEFORE_SUBMIT_WAIT_MS || 750);
 
   if (!usernameSelector || !passwordSelector || !username || !password) {
     throw new Error('SUBMIT_CREDENTIALS requires USERNAME_SELECTOR, PASSWORD_SELECTOR, LOGIN_USERNAME, and LOGIN_PASSWORD.');
   }
 
-  await page.locator(usernameSelector).waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-  await page.locator(usernameSelector).fill(username);
-  await page.locator(passwordSelector).waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-  await page.locator(passwordSelector).fill(password);
+  const frame = getLoginFrame(page);
+  const root = frame || (frameSelector ? page.frameLocator(frameSelector) : page);
+  const usernameField = root.locator(usernameSelector);
+  const passwordField = root.locator(passwordSelector);
+  const submitButton = submitSelector ? root.locator(submitSelector) : null;
 
-  if (submitSelector) {
-    await page.locator(submitSelector).click();
+  await usernameField.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await usernameField.click();
+  await page.keyboard.type(username, { delay: usernameDelayMs });
+  await passwordField.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await passwordField.click();
+  await page.keyboard.type(password, { delay: passwordDelayMs });
+  if (beforeSubmitWaitMs > 0) {
+    await page.waitForTimeout(beforeSubmitWaitMs);
+  }
+
+  if (submitButton) {
+    await submitButton.click();
   } else {
-    await page.locator(passwordSelector).press('Enter');
+    await passwordField.press('Enter');
+  }
+}
+
+async function runLogonValidation(page, outputDir, results) {
+  const logonSkipReason = getLogonSkipReason();
+  if (logonSkipReason) {
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      'SKIP',
+      {
+        reason: logonSkipReason.reason,
+        flag: 'TEST_LOGON',
+        enabledValue: 'true',
+        compatibilityFlag: 'SUBMIT_CREDENTIALS',
+        ...(logonSkipReason.missing ? { missing: logonSkipReason.missing } : {}),
+      },
+      [],
+      logonSkipReason.errors
+    );
+    return;
+  }
+
+  try {
+    const beforeLogonScreenshot = await runStep('save before-logon screenshot', () => saveScreenshot(page, 'before-logon'));
+    const beforeLogonInputDiscovery = await runStep('discover before-logon input fields', () => discoverInputFields(page));
+    const beforeLogonInputFile = saveJson(path.join(outputDir, 'input-fields-before-logon.json'), beforeLogonInputDiscovery);
+    const matcher = process.env.LOGIN_REQUEST_MATCHER || '';
+    const requestPromise = matcher ? waitForLoginRequest(page, matcher).catch((error) => ({ __error: error.message })) : Promise.resolve({ __error: 'LOGIN_REQUEST_MATCHER is not configured' });
+    await runStep('fill and submit login form', () => fillAndSubmit(page));
+    const loginRequest = await runStep('wait for login request', () => requestPromise);
+    await runStep('wait for post-submit load state', () => page.waitForLoadState(process.env.POST_SUBMIT_LOAD_STATE || 'networkidle', { timeout: Number(process.env.POST_SUBMIT_TIMEOUT_MS || 30000) }).catch(() => {}));
+    const afterSubmitScreenshot = await runStep('save after-submit screenshot', () => saveScreenshot(page, 'after-submit'));
+    await runStep('post-submit cookie settle wait', () => waitForCookieSettle(page, 'post_submit'));
+    const afterSubmitCookies = parseCookieArray(await runStep('read post-submit DFS cookies', () => getDfsCookies(page)));
+    const afterSubmitFingerprint = await runStep('read post-submit fingerprint', () => getFingerprint(page));
+    const requestDetails = loginRequest.__error
+      ? { error: loginRequest.__error }
+      : {
+          url: loginRequest.url(),
+          method: loginRequest.method(),
+          headers: loginRequest.headers(),
+          postData: loginRequest.postData(),
+          postDataJSON: loginRequest.postDataJSON ? tryPostDataJson(loginRequest) : null,
+        };
+    const requestFile = saveJson(path.join(outputDir, 'network-login-request.json'), requestDetails);
+    const afterSubmitCookiesFile = saveJson(path.join(outputDir, 'cookies-after-submit.json'), afterSubmitCookies);
+    const afterSubmitFingerprintFile = saveJson(path.join(outputDir, 'fingerprint-after-submit.json'), afterSubmitFingerprint);
+    const dfsE5DebugFile = saveJson(path.join(outputDir, 'dfs-e5-debug-log.json'), await runStep('read dfs_E_5 debug log', () => getDfsE5DebugLog(page)));
+    const afterSubmitComparison = compareCookieToFingerprint(afterSubmitCookies, afterSubmitFingerprint);
+    const expectedTelemetry = flattenDfsBValues(afterSubmitFingerprint);
+    const actualTelemetry = findAuthTelemetry(requestDetails.postDataJSON || requestDetails.postData);
+    const headers = requestDetails.headers || {};
+    const submitValidation = {
+      missingCookies: requiredCookieFailures(afterSubmitCookies),
+      cookieComparison: afterSubmitComparison,
+      auth_fingerprintTelemetry: {
+        actual: actualTelemetry,
+        expectedConcatenatedDfsB: expectedTelemetry,
+        matches: actualTelemetry === undefined || !expectedTelemetry ? null : String(actualTelemetry) === String(expectedTelemetry),
+      },
+      headers: {
+        dfsosbrowser: headers.dfsosbrowser,
+        expectedDfsOsBrowser: afterSubmitCookies.dfs_E_6,
+        dfsagenticscore: headers.dfsagenticscore,
+        expectedDfsAgenticScore: afterSubmitCookies.dfs_E_5,
+      },
+    };
+    const submitComparisonFile = saveJson(path.join(outputDir, 'submit-request-comparison.json'), submitValidation);
+    const submitFailures = [
+      ...submitValidation.missingCookies.map((key) => `Missing or empty cookie after submit: ${key}`),
+      ...(submitValidation.auth_fingerprintTelemetry.matches === false ? ['auth_fingerprintTelemetry does not match concatenated dfs_B* value'] : []),
+      ...(headers.dfsosbrowser && afterSubmitCookies.dfs_E_6 && headers.dfsosbrowser !== afterSubmitCookies.dfs_E_6 ? ['dfsosbrowser header does not match dfs_E_6'] : []),
+      ...(headers.dfsagenticscore && afterSubmitCookies.dfs_E_5 && headers.dfsagenticscore !== afterSubmitCookies.dfs_E_5 ? ['dfsagenticscore header does not match dfs_E_5'] : []),
+      ...(requestDetails.error ? [requestDetails.error] : []),
+    ];
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      submitFailures.length === 0 ? 'PASS' : 'FAIL',
+      submitValidation,
+      [beforeLogonScreenshot, beforeLogonInputFile, afterSubmitScreenshot, requestFile, afterSubmitCookiesFile, afterSubmitFingerprintFile, submitComparisonFile, dfsE5DebugFile],
+      submitFailures
+    );
+  } catch (error) {
+    const failureEvidence = [];
+    try {
+      failureEvidence.push(await runStep('save failed-logon screenshot', () => saveScreenshot(page, 'failed-logon')));
+    } catch {
+      // Keep the original login failure as the useful error.
+    }
+    try {
+      const failedLogonInputDiscovery = await runStep('discover failed-logon input fields', () => discoverInputFields(page));
+      failureEvidence.push(saveJson(path.join(outputDir, 'input-fields-failed-logon.json'), failedLogonInputDiscovery));
+    } catch {
+      // Keep the original login failure as the useful error.
+    }
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      'FAIL',
+      {
+        reason: 'Logon validation failed before post-submit evidence could be collected.',
+        usernameSelector: process.env.USERNAME_SELECTOR,
+        passwordSelector: process.env.PASSWORD_SELECTOR,
+        submitSelector: process.env.SUBMIT_SELECTOR,
+        error: error.message,
+      },
+      failureEvidence,
+      [error.message]
+    );
+  }
+}
+
+async function discoverInputFields(page) {
+  const frames = page.frames();
+  const results = [];
+
+  for (const [frameIndex, frame] of frames.entries()) {
+    const frameFields = await frame.evaluate(() => {
+      function cssEscape(value) {
+        if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+        return String(value).replace(/["\\#.:,[\]>+~*^$|= !]/g, '\\$&');
+      }
+
+      function quoteAttr(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      }
+
+      function isVisible(el) {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== 'hidden'
+          && style.display !== 'none'
+          && Number(style.opacity || 1) !== 0
+          && rect.width > 0
+          && rect.height > 0;
+      }
+
+      function labelText(el) {
+        const labels = Array.from(el.labels || []).map((label) => label.innerText.trim()).filter(Boolean);
+        if (labels.length > 0) return labels.join(' | ');
+
+        if (el.id) {
+          const explicit = document.querySelector(`label[for="${quoteAttr(el.id)}"]`);
+          if (explicit && explicit.innerText.trim()) return explicit.innerText.trim();
+        }
+
+        const parentLabel = el.closest('label');
+        return parentLabel ? parentLabel.innerText.trim() : '';
+      }
+
+      function nthSelector(el) {
+        const tag = el.tagName.toLowerCase();
+        const siblings = Array.from(document.querySelectorAll(tag));
+        const index = siblings.indexOf(el) + 1;
+        return index > 0 ? `${tag}:nth-of-type(${index})` : tag;
+      }
+
+      function selectorFor(el) {
+        const tag = el.tagName.toLowerCase();
+        const candidates = [];
+
+        if (el.id) candidates.push(`#${cssEscape(el.id)}`);
+        for (const attr of ['data-testid', 'data-test', 'data-cy', 'name', 'aria-label', 'placeholder', 'type']) {
+          const value = el.getAttribute(attr);
+          if (value) candidates.push(`${tag}[${attr}="${quoteAttr(value)}"]`);
+        }
+
+        return candidates.find((candidate) => {
+          try {
+            return document.querySelectorAll(candidate).length === 1;
+          } catch {
+            return false;
+          }
+        }) || nthSelector(el);
+      }
+
+      function textFor(el) {
+        if (el.matches('input, textarea, select')) return '';
+        return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ');
+      }
+
+      const elements = Array.from(document.querySelectorAll([
+        'input',
+        'textarea',
+        'select',
+        'button',
+        '[role="button"]',
+        'a[href]',
+      ].join(',')));
+
+      return elements.map((el, index) => {
+        const rect = el.getBoundingClientRect();
+        const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
+        const visible = isVisible(el);
+        const disabled = Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true';
+        const text = textFor(el);
+        const label = labelText(el);
+        const inputCandidate = el.matches('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
+        const fieldHints = `${type} ${el.id || ''} ${el.name || ''} ${el.getAttribute('autocomplete') || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('placeholder') || ''} ${label}`;
+        const isSubmitCandidate = el.matches('button, [role="button"], a[href], input[type="submit"], input[type="button"]')
+          && /submit|sign in|signin|log in|login|continue|next|verify|authenticate/i.test(`${type} ${text} ${label} ${el.id || ''} ${el.name || ''} ${el.getAttribute('aria-label') || ''}`);
+
+        return {
+          index,
+          tag: el.tagName.toLowerCase(),
+          type,
+          selector: selectorFor(el),
+          id: el.id || '',
+          name: el.getAttribute('name') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          autocomplete: el.getAttribute('autocomplete') || '',
+          ariaLabel: el.getAttribute('aria-label') || '',
+          label,
+          text,
+          visible,
+          enabled: !disabled,
+          required: Boolean(el.required) || el.getAttribute('aria-required') === 'true',
+          inputCandidate,
+          passwordCandidate: inputCandidate && (el.matches('input[type="password"]') || /password/i.test(fieldHints)),
+          usernameCandidate: inputCandidate && /user|username|email|login|member/i.test(fieldHints),
+          submitCandidate: isSubmitCandidate,
+          boundingBox: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+          },
+        };
+      });
+    }).catch((error) => ([{
+      frameError: error.message,
+    }]));
+
+    results.push({
+      frameIndex,
+      frameName: frame.name(),
+      frameUrl: frame.url(),
+      fields: frameFields,
+    });
+  }
+
+  return {
+    capturedAt: new Date().toISOString(),
+    pageUrl: page.url(),
+    frames: results,
+    totals: {
+      frames: results.length,
+      fields: results.reduce((sum, frame) => sum + frame.fields.length, 0),
+      visibleFields: results.reduce((sum, frame) => sum + frame.fields.filter((field) => field.visible).length, 0),
+      inputCandidates: results.reduce((sum, frame) => sum + frame.fields.filter((field) => field.inputCandidate && field.visible).length, 0),
+      passwordCandidates: results.reduce((sum, frame) => sum + frame.fields.filter((field) => field.passwordCandidate && field.visible).length, 0),
+      submitCandidates: results.reduce((sum, frame) => sum + frame.fields.filter((field) => field.submitCandidate && field.visible).length, 0),
+    },
+  };
+}
+
+function logInputDiscovery(discovery) {
+  console.log(`    input discovery: ${discovery.totals.visibleFields}/${discovery.totals.fields} visible controls across ${discovery.totals.frames} frame(s)`);
+
+  for (const frame of discovery.frames) {
+    const visible = frame.fields.filter((field) => field.visible);
+    if (visible.length === 0) continue;
+
+    console.log(`    frame ${frame.frameIndex}: ${frame.frameUrl}`);
+    for (const field of visible) {
+      const role = [
+        field.usernameCandidate ? 'username?' : '',
+        field.passwordCandidate ? 'password?' : '',
+        field.submitCandidate ? 'submit?' : '',
+      ].filter(Boolean).join(' ');
+      const label = field.label || field.placeholder || field.ariaLabel || field.text || field.name || field.id || field.type;
+      console.log(`      ${field.selector} | ${field.tag}/${field.type} | ${label}${role ? ` | ${role}` : ''}`);
+    }
   }
 }
 
@@ -645,7 +1014,7 @@ function writeRunProgress() {
 }
 
 async function runStep(label, action) {
-  const traceSteps = readBoolean('TRACE_STEPS', true);
+  const traceSteps = readBoolean('TRACE_STEPS', false);
   const stallLogMs = Number(process.env.STEP_STALL_LOG_MS || 10000);
   const stepTimeoutMs = Number(process.env.STEP_TIMEOUT_MS || 60000);
   const step = {
@@ -717,7 +1086,9 @@ async function runTarget(target, config) {
   const dfsJsFiles = [];
   const releaseVersion = getReleaseVersion();
   const browserVersion = target.configuredVersion;
-  const outputDir = path.join(config.releaseDir, sanitizeSegment(target.browser), sanitizeSegment(browserVersion));
+  const outputDir = config.lob
+    ? path.join(config.releaseDir, sanitizeSegment(config.lob), sanitizeSegment(target.browser), sanitizeSegment(browserVersion))
+    : path.join(config.releaseDir, sanitizeSegment(target.browser), sanitizeSegment(browserVersion));
   currentRun = { outputDir, steps: [], currentStep: null };
   fs.mkdirSync(path.join(outputDir, 'screenshots'), { recursive: true });
 
@@ -726,6 +1097,7 @@ async function runTarget(target, config) {
     configuredVersion: target.configuredVersion,
     executablePath: target.executablePath,
     launchMode: usesBundledFirefox(target) ? 'playwright-bundled-firefox' : 'configured-executable',
+    lob: config.lob || null,
     targetUrl: config.targetUrl,
     releaseVersion,
     startedAt: new Date().toISOString(),
@@ -826,7 +1198,25 @@ async function runTarget(target, config) {
     await runStep('post-load wait', () => page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
 
     const screenshotInitial = await runStep('save initial-page screenshot', () => saveScreenshot(page, 'initial-page'));
+    const inputDiscovery = await runStep('discover page input fields', () => discoverInputFields(page));
+    const inputDiscoveryFile = saveJson(path.join(outputDir, 'input-fields.json'), inputDiscovery);
+    logInputDiscovery(inputDiscovery);
+    addResult(
+      results,
+      'Page Input Field Discovery',
+      inputDiscovery.totals.visibleFields > 0 ? 'PASS' : 'FAIL',
+      inputDiscovery.totals,
+      [inputDiscoveryFile, screenshotInitial],
+      inputDiscovery.totals.visibleFields > 0 ? [] : ['No visible input, button, or link controls were found on the page.']
+    );
+
+    if (readBoolean('DISCOVER_INPUTS_ONLY', false)) {
+      metadata.discoveryOnly = true;
+      return { metadata, results };
+    }
+
     initialFingerprint = await runStep('read initial fingerprint', () => getFingerprint(page));
+    await runStep('initial cookie settle wait', () => waitForCookieSettle(page, 'initial'));
     const initialCookies = await runStep('read initial DFS cookies', () => getDfsCookies(page));
     initialCookieMap = parseCookieArray(initialCookies);
     initialDfsF1 = getFingerprintValue(initialFingerprint, 'dfs_F_1');
@@ -940,6 +1330,13 @@ async function runTarget(target, config) {
       missingPrefixes.map((prefix) => `No non-empty key found for ${prefix}*`)
     );
 
+    const loginBeforeMouse = readBoolean('LOGIN_BEFORE_MOUSE', false);
+    let logonValidationRan = false;
+    if (loginBeforeMouse) {
+      await runLogonValidation(page, outputDir, results);
+      logonValidationRan = true;
+    }
+
     if (readBoolean('PERFORM_MOUSE_MOVEMENT', true)) {
       await runStep('pre-mouse wait', () => page.waitForTimeout(Number(process.env.MOUSE_WAIT_BEFORE_MS || 15000)));
       await runStep('perform mouse movement', () => maybeMoveMouse(page));
@@ -964,115 +1361,45 @@ async function runTarget(target, config) {
       );
     }
 
-    await runStep('reload page', () => page.reload({ waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded', timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000) }));
-    await runStep('post-reload wait', () => page.waitForTimeout(Number(process.env.POST_RELOAD_WAIT_MS || 5000)));
-    const fingerprintAfterReload = await runStep('read fingerprint after reload', () => getFingerprint(page));
-    const afterReloadDfsF1 = getFingerprintValue(fingerprintAfterReload, 'dfs_F_1');
-    const afterReloadFile = saveJson(path.join(outputDir, 'fingerprint-after-reload.json'), fingerprintAfterReload);
-    const reloadComparison = {
-      before: initialDfsF1,
-      after: afterReloadDfsF1,
-      stable: initialDfsF1 !== undefined && afterReloadDfsF1 !== undefined && String(initialDfsF1) === String(afterReloadDfsF1),
-    };
-    const reloadFile = saveJson(path.join(outputDir, 'session-stability.json'), reloadComparison);
-    addResult(
-      results,
-      'Session Stability',
-      reloadComparison.stable ? 'PASS' : 'FAIL',
-      reloadComparison,
-      [afterReloadFile, reloadFile],
-      reloadComparison.stable ? [] : ['dfs_F_1 changed after reload']
-    );
+    const loginBeforeReload = readBoolean('LOGIN_BEFORE_RELOAD', false);
+    if (loginBeforeReload && !logonValidationRan) {
+      await runLogonValidation(page, outputDir, results);
+      logonValidationRan = true;
+    }
 
-    const logonSkipReason = getLogonSkipReason();
-    if (!logonSkipReason) {
-      try {
-        const matcher = process.env.LOGIN_REQUEST_MATCHER || '';
-        const requestPromise = matcher ? waitForLoginRequest(page, matcher).catch((error) => ({ __error: error.message })) : Promise.resolve({ __error: 'LOGIN_REQUEST_MATCHER is not configured' });
-        await runStep('fill and submit login form', () => fillAndSubmit(page));
-        const loginRequest = await runStep('wait for login request', () => requestPromise);
-        await runStep('wait for post-submit load state', () => page.waitForLoadState(process.env.POST_SUBMIT_LOAD_STATE || 'networkidle', { timeout: Number(process.env.POST_SUBMIT_TIMEOUT_MS || 30000) }).catch(() => {}));
-        const afterSubmitScreenshot = await runStep('save after-submit screenshot', () => saveScreenshot(page, 'after-submit'));
-        const afterSubmitCookies = parseCookieArray(await runStep('read post-submit DFS cookies', () => getDfsCookies(page)));
-        const afterSubmitFingerprint = await runStep('read post-submit fingerprint', () => getFingerprint(page));
-        const requestDetails = loginRequest.__error
-          ? { error: loginRequest.__error }
-          : {
-              url: loginRequest.url(),
-              method: loginRequest.method(),
-              headers: loginRequest.headers(),
-              postData: loginRequest.postData(),
-              postDataJSON: loginRequest.postDataJSON ? tryPostDataJson(loginRequest) : null,
-            };
-        const requestFile = saveJson(path.join(outputDir, 'network-login-request.json'), requestDetails);
-        const afterSubmitCookiesFile = saveJson(path.join(outputDir, 'cookies-after-submit.json'), afterSubmitCookies);
-        const afterSubmitFingerprintFile = saveJson(path.join(outputDir, 'fingerprint-after-submit.json'), afterSubmitFingerprint);
-        const afterSubmitComparison = compareCookieToFingerprint(afterSubmitCookies, afterSubmitFingerprint);
-        const expectedTelemetry = flattenDfsBValues(afterSubmitFingerprint);
-        const actualTelemetry = findAuthTelemetry(requestDetails.postDataJSON || requestDetails.postData);
-        const headers = requestDetails.headers || {};
-        const submitValidation = {
-          missingCookies: requiredCookieFailures(afterSubmitCookies),
-          cookieComparison: afterSubmitComparison,
-          auth_fingerprintTelemetry: {
-            actual: actualTelemetry,
-            expectedConcatenatedDfsB: expectedTelemetry,
-            matches: actualTelemetry === undefined || !expectedTelemetry ? null : String(actualTelemetry) === String(expectedTelemetry),
-          },
-          headers: {
-            dfsosbrowser: headers.dfsosbrowser,
-            expectedDfsOsBrowser: afterSubmitCookies.dfs_E_6,
-            dfsagenticscore: headers.dfsagenticscore,
-            expectedDfsAgenticScore: afterSubmitCookies.dfs_E_5,
-          },
-        };
-        const submitComparisonFile = saveJson(path.join(outputDir, 'submit-request-comparison.json'), submitValidation);
-        const submitFailures = [
-          ...submitValidation.missingCookies.map((key) => `Missing or empty cookie after submit: ${key}`),
-          ...(submitValidation.auth_fingerprintTelemetry.matches === false ? ['auth_fingerprintTelemetry does not match concatenated dfs_B* value'] : []),
-          ...(headers.dfsosbrowser && afterSubmitCookies.dfs_E_6 && headers.dfsosbrowser !== afterSubmitCookies.dfs_E_6 ? ['dfsosbrowser header does not match dfs_E_6'] : []),
-          ...(headers.dfsagenticscore && afterSubmitCookies.dfs_E_5 && headers.dfsagenticscore !== afterSubmitCookies.dfs_E_5 ? ['dfsagenticscore header does not match dfs_E_5'] : []),
-          ...(requestDetails.error ? [requestDetails.error] : []),
-        ];
-        addResult(
-          results,
-          'Cookies and Payload After Form Submission',
-          submitFailures.length === 0 ? 'PASS' : 'FAIL',
-          submitValidation,
-          [afterSubmitScreenshot, requestFile, afterSubmitCookiesFile, afterSubmitFingerprintFile, submitComparisonFile],
-          submitFailures
-        );
-      } catch (error) {
-        addResult(
-          results,
-          'Cookies and Payload After Form Submission',
-          'FAIL',
-          {
-            reason: 'Logon validation failed before post-submit evidence could be collected.',
-            usernameSelector: process.env.USERNAME_SELECTOR,
-            passwordSelector: process.env.PASSWORD_SELECTOR,
-            submitSelector: process.env.SUBMIT_SELECTOR,
-            error: error.message,
-          },
-          [],
-          [error.message]
-        );
-      }
+    if (readBoolean('PERFORM_RELOAD_TEST', true)) {
+      await runStep('reload page', () => page.reload({ waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded', timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000) }));
+      await runStep('post-reload wait', () => page.waitForTimeout(Number(process.env.POST_RELOAD_WAIT_MS || 5000)));
+      const fingerprintAfterReload = await runStep('read fingerprint after reload', () => getFingerprint(page));
+      const afterReloadDfsF1 = getFingerprintValue(fingerprintAfterReload, 'dfs_F_1');
+      const afterReloadFile = saveJson(path.join(outputDir, 'fingerprint-after-reload.json'), fingerprintAfterReload);
+      const reloadComparison = {
+        before: initialDfsF1,
+        after: afterReloadDfsF1,
+        stable: initialDfsF1 !== undefined && afterReloadDfsF1 !== undefined && String(initialDfsF1) === String(afterReloadDfsF1),
+      };
+      const reloadFile = saveJson(path.join(outputDir, 'session-stability.json'), reloadComparison);
+      addResult(
+        results,
+        'Session Stability',
+        reloadComparison.stable ? 'PASS' : 'FAIL',
+        reloadComparison,
+        [afterReloadFile, reloadFile],
+        reloadComparison.stable ? [] : ['dfs_F_1 changed after reload']
+      );
     } else {
       addResult(
         results,
-        'Cookies and Payload After Form Submission',
+        'Session Stability',
         'SKIP',
-        {
-          reason: logonSkipReason.reason,
-          flag: 'TEST_LOGON',
-          enabledValue: 'true',
-          compatibilityFlag: 'SUBMIT_CREDENTIALS',
-          ...(logonSkipReason.missing ? { missing: logonSkipReason.missing } : {}),
-        },
+        { reason: 'PERFORM_RELOAD_TEST=false; reload skipped by configuration.' },
         [],
-        logonSkipReason.errors
+        ['Reload/session-stability validation skipped by configuration.']
       );
+    }
+
+    if (!loginBeforeReload && !logonValidationRan) {
+      await runLogonValidation(page, outputDir, results);
     }
 
     const expectedDfsE8 = process.env.EXPECTED_DFS_E_8 || process.env.RELEASE_VERSION;
@@ -1203,6 +1530,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     const resultByName = new Map(item.results.map((result) => [result.testName, result]));
     const runDir = path.join(
       releaseDir,
+      ...(item.metadata.lob ? [sanitizeSegment(item.metadata.lob)] : []),
       sanitizeSegment(item.metadata.browser),
       sanitizeSegment(item.metadata.configuredVersion)
     );
@@ -1218,6 +1546,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
 
     return `
       <tr>
+        <td>${escapeHtml(item.metadata.lob || '')}</td>
         <td>${escapeHtml(item.metadata.browser)}</td>
         <td>${escapeHtml(item.metadata.configuredVersion)}</td>
         <td>${escapeHtml(item.metadata.actualBrowserVersion || '')}</td>
@@ -1254,7 +1583,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
 <body>
   <h1>DFS Evidence Report</h1>
   <p class="meta">Release: ${escapeHtml(context.releaseVersion)}</p>
-  <p class="meta">Target URL: ${escapeHtml(context.targetUrl)}</p>
+  <p class="meta">Target URL(s): ${escapeHtml(context.targetUrl)}</p>
   <p class="meta">Generated: ${escapeHtml(generatedAt)}</p>
   <p class="meta">Aggregate JSON: <a href="${escapeHtml(aggregateLink)}">${escapeHtml(aggregateLink)}</a></p>
   <div class="totals">
@@ -1267,6 +1596,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
   <table>
     <thead>
       <tr>
+        <th>LOB</th>
         <th>Browser</th>
         <th>Configured Version</th>
         <th>Actual Version</th>
@@ -1288,20 +1618,10 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
 
 async function main() {
   loadEnvFile(process.env.DFS_ENV_FILE || DEFAULT_ENV_FILE);
-  let targetUrl = process.env.TARGET_URL;
-  if (!targetUrl) {
-    throw new Error('TARGET_URL is required. Set it in .env or the environment.');
-  }
-  targetUrl = requireHttpsUrl(targetUrl);
+  const lobs = getLobs();
+  const allTargets = discoverBrowserTargets();
 
-  const selectedBrowsers = (process.env.BROWSERS || '')
-    .split(',')
-    .map((browser) => browser.trim())
-    .filter(Boolean);
-  const targets = discoverBrowserTargets()
-    .filter((target) => selectedBrowsers.length === 0 || selectedBrowsers.includes(target.browser));
-
-  if (targets.length === 0) {
+  if (allTargets.length === 0) {
     throw new Error(`No browser executable paths found in ${BROWSER_PATHS_FILE}.`);
   }
 
@@ -1310,21 +1630,42 @@ async function main() {
   console.log(`Evidence directory: ${releaseDir}`);
 
   const aggregate = [];
-  for (const target of targets) {
-    const launchNote = usesBundledFirefox(target) ? ' using Playwright bundled Firefox' : '';
-    console.log(`Running ${target.browser} ${target.configuredVersion}: ${target.executablePath}${launchNote}`);
-    const result = await runTarget(target, { targetUrl, releaseDir });
-    const failed = result.results.filter((test) => test.status === 'FAIL').length;
-    const passed = result.results.filter((test) => test.status === 'PASS').length;
-    const skipped = result.results.filter((test) => test.status === 'SKIP').length;
-    console.log(`  ${passed}/${result.results.length} passed, ${failed} failed, ${skipped} skipped`);
-    aggregate.push(result);
+  const targetUrls = {};
+  const runLobs = lobs.length > 0 ? lobs : [null];
+
+  for (const lob of runLobs) {
+    await withLobEnvironment(lob, async () => {
+      const selectedBrowsers = parseList(process.env.BROWSERS);
+      const targets = allTargets.filter((target) => selectedBrowsers.length === 0 || selectedBrowsers.includes(target.browser));
+      if (targets.length === 0) {
+        throw new Error(`No browser executable paths selected for ${lob || 'default'} in ${BROWSER_PATHS_FILE}.`);
+      }
+
+      let targetUrl = process.env.TARGET_URL;
+      if (!targetUrl) {
+        throw new Error(`${lob ? `${lob} ` : ''}TARGET_URL is required. Set ${lob ? `${lob}.TARGET_URL` : 'TARGET_URL'} in .env or the environment.`);
+      }
+      targetUrl = requireHttpsUrl(targetUrl);
+      targetUrls[lob || 'default'] = targetUrl;
+
+      for (const target of targets) {
+        const launchNote = usesBundledFirefox(target) ? ' using Playwright bundled Firefox' : '';
+        const lobLabel = lob ? `${lob} ` : '';
+        console.log(`Running ${lobLabel}${target.browser} ${target.configuredVersion}: ${target.executablePath}${launchNote}`);
+        const result = await runTarget(target, { targetUrl, releaseDir, lob });
+        const failed = result.results.filter((test) => test.status === 'FAIL').length;
+        const passed = result.results.filter((test) => test.status === 'PASS').length;
+        const skipped = result.results.filter((test) => test.status === 'SKIP').length;
+        console.log(`  ${passed}/${result.results.length} passed, ${failed} failed, ${skipped} skipped`);
+        aggregate.push(result);
+      }
+    });
   }
 
   const aggregatePath = path.join(releaseDir, 'summary-report.json');
   saveJson(aggregatePath, {
     releaseVersion,
-    targetUrl,
+    targetUrls,
     totals: {
       browsers: aggregate.length,
       tests: aggregate.reduce((sum, item) => sum + item.results.length, 0),
@@ -1337,7 +1678,10 @@ async function main() {
       results: item.results,
     })),
   });
-  const coverReportPath = writeCoverReport(releaseDir, aggregate, aggregatePath, { releaseVersion, targetUrl });
+  const coverReportPath = writeCoverReport(releaseDir, aggregate, aggregatePath, {
+    releaseVersion,
+    targetUrl: Object.entries(targetUrls).map(([lob, url]) => `${lob}: ${url}`).join(', '),
+  });
 
   console.log(`Summary: ${aggregatePath}`);
   console.log(`Cover report: ${coverReportPath}`);

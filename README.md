@@ -115,19 +115,54 @@ TARGET_URL=https://your-login-page.example
 RELEASE_VERSION=expected_dfs_E_8_value
 ```
 
+To run multiple lines of business in one test pass, set `LOBS` and prefix LOB-specific settings with `LOB.PROPERTY`. Unprefixed settings are used as defaults.
+
+```properties
+LOBS=PUBLIC,SECURE
+
+PUBLIC.TARGET_URL=https://www.chase.com
+PUBLIC.USERNAME_SELECTOR=#userId-text-input-field
+PUBLIC.PASSWORD_SELECTOR=#password-text-input-field
+PUBLIC.SUBMIT_SELECTOR=#signin-button
+
+SECURE.TARGET_URL=https://secure.chase.com
+SECURE.LOGIN_FRAME_SELECTOR=iframe[name="logonbox"]
+SECURE.LOGIN_FRAME_NAME=logonbox
+SECURE.LOGIN_BEFORE_MOUSE=true
+SECURE.LOGIN_BEFORE_RELOAD=true
+SECURE.PERFORM_RELOAD_TEST=true
+SECURE.USERNAME_SELECTOR=#userId-input-field-input
+SECURE.PASSWORD_SELECTOR=#password-input-field-input
+SECURE.SUBMIT_SELECTOR=#signin-button
+```
+
 Common options:
 
 ```properties
 # Leave blank to run every browser key/path in browser-paths.properties.
 BROWSERS=chrome,opera,firefox,edge
 
-HEADLESS=false
+HEADLESS=true
 PERFORM_MOUSE_MOVEMENT=true
+DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
 POST_LOAD_WAIT_MS=2000
 ```
+
+Keep `HEADLESS=true` for request-capture flows where headed browser automation changes or blocks the requests being tested. Use headed mode only for visual debugging.
+
+Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
+
+To scan the loaded page and list candidate username, password, and submit selectors without running the full validation:
+
+```powershell
+$env:DISCOVER_INPUTS_ONLY='true'
+npm run dfs:test
+```
+
+The runner writes `input-fields.json` under the browser evidence folder and prints visible controls to the console.
 
 Playwright cannot reliably drive stock system Firefox with the protocol it uses. Keep a `firefox=` entry in `browser-paths.properties` to include Firefox in the run, but leave `FIREFOX_USE_PLAYWRIGHT_BUNDLED=true` so the runner launches Playwright's bundled Firefox. Set it to `false` only if you intentionally want to try a system Firefox executable.
 
@@ -141,6 +176,11 @@ USERNAME_SELECTOR=#userId-input-field-input
 PASSWORD_SELECTOR=#password-input-field-input
 SUBMIT_SELECTOR=#signin-button
 LOGIN_REQUEST_MATCHER=/login|auth|signin/i
+COOKIE_SETTLE_WAIT_MS=0
+INITIAL_COOKIE_WAIT_MS=
+POST_SUBMIT_COOKIE_WAIT_MS=
+TYPE_DELAY_MS=50
+BEFORE_SUBMIT_WAIT_MS=750
 ```
 
 ## Run DFS Test
