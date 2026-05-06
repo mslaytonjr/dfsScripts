@@ -189,6 +189,79 @@ async function getDfsE5DebugLog(page) {
   return page.evaluate(() => Array.isArray(window.__DFS_E5_DEBUG_LOG) ? window.__DFS_E5_DEBUG_LOG : []);
 }
 
+async function getBrowserDetectionFailureSignals(page) {
+  return page.evaluate(async () => {
+    function readWindowValue(name) {
+      const present = Object.prototype.hasOwnProperty.call(window, name) || name in window;
+      const value = present ? window[name] : undefined;
+      return {
+        present,
+        type: typeof value,
+        value: typeof value === 'function' ? `[function ${value.name || 'anonymous'}]` : value,
+      };
+    }
+
+    function safeResourceEntries(pattern) {
+      try {
+        return performance.getEntriesByType('resource')
+          .filter((entry) => pattern.test(entry.name))
+          .map((entry) => ({
+            name: entry.name,
+            initiatorType: entry.initiatorType,
+            transferSize: entry.transferSize,
+            encodedBodySize: entry.encodedBodySize,
+            decodedBodySize: entry.decodedBodySize,
+          }));
+      } catch (error) {
+        return [{ error: error.message }];
+      }
+    }
+
+    const sentryWindowKeys = Object.keys(window)
+      .filter((key) => /sentry/i.test(key))
+      .sort()
+      .map((key) => ({
+        key,
+        type: typeof window[key],
+      }));
+
+    const highEntropyUserAgentData = navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function'
+      ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList', 'uaFullVersion', 'platform', 'platformVersion'])
+        .catch((error) => ({ error: error.message }))
+      : null;
+
+    return {
+      capturedAt: new Date().toISOString(),
+      browserDetectionInputs: {
+        expectedMissingGlobals: ['BOOMR_check_doc_domain'],
+        BOOMR_check_doc_domain: readWindowValue('BOOMR_check_doc_domain'),
+        BOOMR_check_domain: readWindowValue('BOOMR_check_domain'),
+        _sentryDebugIdIdentifier: readWindowValue('_sentryDebugIdIdentifier'),
+        globalPrivacyControlPresent: 'globalPrivacyControl' in navigator || navigator.globalPrivacyControl !== undefined,
+        globalPrivacyControlValue: navigator.globalPrivacyControl,
+        bmRM: readWindowValue('bmRM'),
+      },
+      userAgentData: {
+        lowEntropy: navigator.userAgentData && typeof navigator.userAgentData.toJSON === 'function'
+          ? navigator.userAgentData.toJSON()
+          : null,
+        highEntropy: highEntropyUserAgentData,
+      },
+      sentry: {
+        Sentry: readWindowValue('Sentry'),
+        __SENTRY__: readWindowValue('__SENTRY__'),
+        _sentryDebugIdIdentifier: readWindowValue('_sentryDebugIdIdentifier'),
+        sentryWindowKeys,
+        resources: safeResourceEntries(/sentry/i),
+      },
+      boomrCheckDomain: readWindowValue('BOOMR_check_domain'),
+      boomrCheckDocDomain: readWindowValue('BOOMR_check_doc_domain'),
+      dfsJsResources: safeResourceEntries(/\/dfs\.js(?:[?#]|$)/i),
+      boomrResources: safeResourceEntries(/boomr|boomerang|akamai/i),
+    };
+  });
+}
+
 async function getBrowserFailureDiagnostics(page) {
   return page.evaluate(async () => {
     async function readExpression(expression, getter) {
@@ -310,6 +383,11 @@ function getExpectedDfsE6(browser) {
   const browserCode = BROWSER_CODES[browser];
   if (!osCode || !browserCode) return undefined;
   return `${osCode} - ${browserCode}`;
+}
+
+function getExpectedDfsE7Bit22(browser) {
+  const browsersExpectingMissingClientHints = parseSet(process.env.DFS_E7_BIT22_EXPECTED_1_BROWSERS || process.env.CLIENT_HINTS_MISSING_BROWSERS);
+  return browsersExpectingMissingClientHints.has(String(browser || '').toLowerCase()) ? '1' : '0';
 }
 
 function matcherFromConfig(value) {
@@ -522,6 +600,10 @@ function parseList(value) {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseSet(value) {
+  return new Set(parseList(value).map((item) => item.toLowerCase()));
 }
 
 function getLobs() {
@@ -1261,16 +1343,22 @@ async function runTarget(target, config) {
       expectedValue: getExpectedDfsE6(target.browser),
       expectedFormat: 'dd - dd',
     };
-    const browserDetectionFile = saveJson(path.join(outputDir, 'browser-detection.json'), browserDetection);
     const e6FormatOk = /^\d{2}\s-\s\d{2}$/.test(String(browserDetection.dfs_E_6_cookie || ''));
     const e6Matches = browserDetection.dfs_E_6_fingerprint === undefined || String(browserDetection.dfs_E_6_cookie) === String(browserDetection.dfs_E_6_fingerprint);
     const e6ExpectedMatches = !browserDetection.expectedValue || String(browserDetection.dfs_E_6_cookie) === browserDetection.expectedValue;
+    const browserDetectionPassed = e6FormatOk && e6Matches && e6ExpectedMatches;
+    let browserDetectionFailureSignalsFile = null;
+    if (!browserDetectionPassed) {
+      browserDetection.failureSignals = await runStep('read browser detection failure signals', () => getBrowserDetectionFailureSignals(page));
+      browserDetectionFailureSignalsFile = saveJson(path.join(outputDir, 'browser-detection-failure-signals.json'), browserDetection.failureSignals);
+    }
+    const browserDetectionFile = saveJson(path.join(outputDir, 'browser-detection.json'), browserDetection);
     addResult(
       results,
       'Browser Detection',
-      e6FormatOk && e6Matches && e6ExpectedMatches ? 'PASS' : 'FAIL',
+      browserDetectionPassed ? 'PASS' : 'FAIL',
       browserDetection,
-      [browserDetectionFile],
+      [browserDetectionFile, ...(browserDetectionFailureSignalsFile ? [browserDetectionFailureSignalsFile] : [])],
       [
         ...(e6FormatOk ? [] : ['dfs_E_6 does not match expected format dd - dd']),
         ...(e6Matches ? [] : ['dfs_E_6 cookie does not match fingerprint value']),
@@ -1287,7 +1375,7 @@ async function runTarget(target, config) {
         bit0: expectedWebdriverBit0,
         bit1: '0',
         ...(readBoolean('IGNORE_DFS_E7_BIT16', false) ? {} : { bit16: '0' }),
-        bit22: '0',
+        bit22: getExpectedDfsE7Bit22(target.browser),
         bit25: '0',
         bit26: '0',
         bit27: '0',
@@ -1515,15 +1603,140 @@ function getCoverStatusText(result) {
   return reason ? `${result.status} - ${reason}` : result.status;
 }
 
-function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
-  const allTestNames = [...new Set(aggregate.flatMap((item) => item.results.map((result) => result.testName)))];
-  const totals = {
+function getAggregateTotals(aggregate) {
+  return {
     browsers: aggregate.length,
     tests: aggregate.reduce((sum, item) => sum + item.results.length, 0),
     passed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'PASS').length, 0),
     failed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'FAIL').length, 0),
     skipped: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'SKIP').length, 0),
+    running: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'RUNNING').length, 0),
   };
+}
+
+function createRunningAggregateItem(target, config) {
+  return {
+    metadata: {
+      browser: target.browser,
+      configuredVersion: target.configuredVersion,
+      executablePath: target.executablePath,
+      launchMode: usesBundledFirefox(target) ? 'playwright-bundled-firefox' : 'configured-executable',
+      lob: config.lob || null,
+      targetUrl: config.targetUrl,
+      releaseVersion: config.releaseVersion,
+      startedAt: new Date().toISOString(),
+      actualBrowserVersion: null,
+    },
+    results: [
+      {
+        testName: 'Browser Run',
+        status: 'RUNNING',
+        details: { reason: 'Browser run is in progress.' },
+        evidenceFilePaths: [],
+        errors: [],
+      },
+    ],
+  };
+}
+
+function writeAggregateSummary(releaseDir, aggregate, context) {
+  const aggregatePath = path.join(releaseDir, 'summary-report.json');
+  saveJson(aggregatePath, {
+    releaseVersion: context.releaseVersion,
+    targetUrls: context.targetUrls,
+    generatedAt: new Date().toISOString(),
+    inProgress: Boolean(context.inProgress),
+    totals: getAggregateTotals(aggregate),
+    runs: aggregate.map((item) => ({
+      metadata: item.metadata,
+      results: item.results,
+    })),
+  });
+  return aggregatePath;
+}
+
+function getFingerprintSummaryValue(fingerprintFile) {
+  if (!fingerprintFile || !fs.existsSync(fingerprintFile)) return '';
+  try {
+    const fingerprint = JSON.parse(fs.readFileSync(fingerprintFile, 'utf8'));
+    const values = extractFingerprintValues(fingerprint);
+    return Object.keys(values).sort().map((key) => `${key}=${values[key]}`).join('; ');
+  } catch (error) {
+    return `Unable to read fingerprint: ${error.message}`;
+  }
+}
+
+function getCookieSummaryValue(cookieFile) {
+  if (!cookieFile || !fs.existsSync(cookieFile)) return '';
+  try {
+    const cookies = JSON.parse(fs.readFileSync(cookieFile, 'utf8'));
+    return Object.keys(cookies).sort().map((key) => `${key}=${cookies[key]}`).join('; ');
+  } catch (error) {
+    return `Unable to read cookies: ${error.message}`;
+  }
+}
+
+function findEvidenceFile(result, fileName) {
+  return (result.evidenceFilePaths || []).find((filePath) => path.basename(filePath) === fileName);
+}
+
+function writePortableEvidenceText(releaseDir, aggregate, context) {
+  const reportPath = path.join(releaseDir, 'portable-evidence.txt');
+  const lines = [
+    'DFS Portable Evidence',
+    `Generated: ${new Date().toISOString()}`,
+    `Release: ${context.releaseVersion}`,
+    `Target URLs: ${Object.entries(context.targetUrls).map(([lob, url]) => `${lob}: ${url}`).join(', ')}`,
+    `Status: ${context.inProgress ? 'IN PROGRESS' : 'COMPLETE'}`,
+    '',
+  ];
+
+  for (const item of aggregate) {
+    const metadata = item.metadata;
+    const fingerprintResult = item.results.find((result) => result.testName === 'Script Initialization and Page Load')
+      || item.results.find((result) => findEvidenceFile(result, 'fingerprint-initial.json'));
+    const cookieResult = item.results.find((result) => result.testName === 'Cookie Presence on Page Load')
+      || item.results.find((result) => findEvidenceFile(result, 'cookies-initial.json'));
+    const fingerprintText = getFingerprintSummaryValue(findEvidenceFile(fingerprintResult || {}, 'fingerprint-initial.json'));
+    const cookieText = getCookieSummaryValue(findEvidenceFile(cookieResult || {}, 'cookies-initial.json'));
+
+    lines.push('='.repeat(100));
+    lines.push(`BROWSER-VERSION: ${metadata.lob ? `${metadata.lob} ` : ''}${metadata.browser} ${metadata.configuredVersion}`);
+    lines.push(`Actual Browser Version: ${metadata.actualBrowserVersion || ''}`);
+    lines.push(`Target URL: ${metadata.targetUrl || ''}`);
+    lines.push('');
+    lines.push('Fingerprint');
+    lines.push(fingerprintText || 'No fingerprint captured.');
+    lines.push('');
+    lines.push('Cookies');
+    lines.push(cookieText || 'No cookies captured.');
+    lines.push('');
+    lines.push('Test Results');
+    for (const result of item.results) {
+      const reason = getResultReason(result);
+      lines.push(`${result.status} | ${result.testName}${reason ? ` | ${reason}` : ''}`);
+    }
+    lines.push('');
+  }
+
+  fs.writeFileSync(reportPath, `${lines.join('\n')}\n`, 'utf8');
+  return reportPath;
+}
+
+function writeLiveReports(releaseDir, aggregate, context) {
+  const aggregatePath = writeAggregateSummary(releaseDir, aggregate, context);
+  const coverReportPath = writeCoverReport(releaseDir, aggregate, aggregatePath, {
+    releaseVersion: context.releaseVersion,
+    targetUrl: Object.entries(context.targetUrls).map(([lob, url]) => `${lob}: ${url}`).join(', '),
+    inProgress: context.inProgress,
+  });
+  const portableEvidencePath = writePortableEvidenceText(releaseDir, aggregate, context);
+  return { aggregatePath, coverReportPath, portableEvidencePath };
+}
+
+function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
+  const allTestNames = [...new Set(aggregate.flatMap((item) => item.results.map((result) => result.testName)))];
+  const totals = getAggregateTotals(aggregate);
   const generatedAt = new Date().toISOString();
 
   const rows = aggregate.map((item) => {
@@ -1539,7 +1752,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     const cells = allTestNames.map((testName) => {
       const result = resultByName.get(testName);
       if (!result) return '<td class="skip">N/A</td>';
-      const statusClass = result.status === 'PASS' ? 'pass' : result.status === 'FAIL' ? 'fail' : 'skip';
+      const statusClass = result.status === 'PASS' ? 'pass' : result.status === 'FAIL' ? 'fail' : result.status === 'RUNNING' ? 'running' : 'skip';
       const title = result.errors && result.errors.length > 0 ? ` title="${escapeHtml(result.errors.join('; '))}"` : '';
       return `<td class="${statusClass}"${title}>${escapeHtml(getCoverStatusText(result))}</td>`;
     }).join('');
@@ -1577,6 +1790,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     .pass { background: #e3fcef; color: #0f5132; font-weight: bold; }
     .fail { background: #ffe3e3; color: #842029; font-weight: bold; }
     .skip { background: #f7f7f7; color: #697386; font-weight: bold; }
+    .running { background: #fff8c5; color: #7a4f01; font-weight: bold; }
     a { color: #0b5cab; }
   </style>
 </head>
@@ -1585,6 +1799,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
   <p class="meta">Release: ${escapeHtml(context.releaseVersion)}</p>
   <p class="meta">Target URL(s): ${escapeHtml(context.targetUrl)}</p>
   <p class="meta">Generated: ${escapeHtml(generatedAt)}</p>
+  <p class="meta">Status: ${context.inProgress ? 'IN PROGRESS - refresh this page for updates' : 'COMPLETE'}</p>
   <p class="meta">Aggregate JSON: <a href="${escapeHtml(aggregateLink)}">${escapeHtml(aggregateLink)}</a></p>
   <div class="totals">
     <div class="total"><strong>${totals.browsers}</strong> Browser Runs</div>
@@ -1592,6 +1807,7 @@ function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
     <div class="total"><strong>${totals.passed}</strong> Passed</div>
     <div class="total"><strong>${totals.failed}</strong> Failed</div>
     <div class="total"><strong>${totals.skipped}</strong> Skipped</div>
+    <div class="total"><strong>${totals.running}</strong> Running</div>
   </div>
   <table>
     <thead>
@@ -1632,6 +1848,11 @@ async function main() {
   const aggregate = [];
   const targetUrls = {};
   const runLobs = lobs.length > 0 ? lobs : [null];
+  let latestReports = writeLiveReports(releaseDir, aggregate, {
+    releaseVersion,
+    targetUrls,
+    inProgress: true,
+  });
 
   for (const lob of runLobs) {
     await withLobEnvironment(lob, async () => {
@@ -1652,39 +1873,37 @@ async function main() {
         const launchNote = usesBundledFirefox(target) ? ' using Playwright bundled Firefox' : '';
         const lobLabel = lob ? `${lob} ` : '';
         console.log(`Running ${lobLabel}${target.browser} ${target.configuredVersion}: ${target.executablePath}${launchNote}`);
+        const aggregateIndex = aggregate.length;
+        aggregate.push(createRunningAggregateItem(target, { targetUrl, lob, releaseVersion }));
+        latestReports = writeLiveReports(releaseDir, aggregate, {
+          releaseVersion,
+          targetUrls,
+          inProgress: true,
+        });
         const result = await runTarget(target, { targetUrl, releaseDir, lob });
         const failed = result.results.filter((test) => test.status === 'FAIL').length;
         const passed = result.results.filter((test) => test.status === 'PASS').length;
         const skipped = result.results.filter((test) => test.status === 'SKIP').length;
         console.log(`  ${passed}/${result.results.length} passed, ${failed} failed, ${skipped} skipped`);
-        aggregate.push(result);
+        aggregate[aggregateIndex] = result;
+        latestReports = writeLiveReports(releaseDir, aggregate, {
+          releaseVersion,
+          targetUrls,
+          inProgress: true,
+        });
       }
     });
   }
 
-  const aggregatePath = path.join(releaseDir, 'summary-report.json');
-  saveJson(aggregatePath, {
+  latestReports = writeLiveReports(releaseDir, aggregate, {
     releaseVersion,
     targetUrls,
-    totals: {
-      browsers: aggregate.length,
-      tests: aggregate.reduce((sum, item) => sum + item.results.length, 0),
-      passed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'PASS').length, 0),
-      failed: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'FAIL').length, 0),
-      skipped: aggregate.reduce((sum, item) => sum + item.results.filter((test) => test.status === 'SKIP').length, 0),
-    },
-    runs: aggregate.map((item) => ({
-      metadata: item.metadata,
-      results: item.results,
-    })),
-  });
-  const coverReportPath = writeCoverReport(releaseDir, aggregate, aggregatePath, {
-    releaseVersion,
-    targetUrl: Object.entries(targetUrls).map(([lob, url]) => `${lob}: ${url}`).join(', '),
+    inProgress: false,
   });
 
-  console.log(`Summary: ${aggregatePath}`);
-  console.log(`Cover report: ${coverReportPath}`);
+  console.log(`Summary: ${latestReports.aggregatePath}`);
+  console.log(`Cover report: ${latestReports.coverReportPath}`);
+  console.log(`Portable evidence: ${latestReports.portableEvidencePath}`);
 }
 
 main().catch((error) => {

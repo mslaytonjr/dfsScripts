@@ -5,8 +5,9 @@
   "main": "dfs-fingerprint-test.js",
   "scripts": {
     "start": "node dfs-fingerprint-test.js",
-    "check": "node --check dfs-fingerprint-test.js",
-    "dfs:test": "node dfs-fingerprint-test.js"
+    "check": "node --check dfs-fingerprint-test.js && node --check chase-console-diff.js",
+    "dfs:test": "node dfs-fingerprint-test.js",
+    "console:diff": "node chase-console-diff.js"
   },
   "private": true,
   "dependencies": {

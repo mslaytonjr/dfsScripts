@@ -148,6 +148,7 @@ DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
+DFS_E7_BIT22_EXPECTED_1_BROWSERS=opera
 POST_LOAD_WAIT_MS=2000
 ```
 
@@ -199,6 +200,138 @@ $env:BROWSERS='chrome,opera'
 npm run dfs:test
 ```
 
+## Compare Chase Console Values
+
+To compare console-accessible browser/page values between Comet and installed system Chrome:
+
+```powershell
+npm run console:diff
+```
+
+By default this visits:
+
+```text
+https://secure.chase.com
+https://www.chase.com
+```
+
+For this runner, `chrome` defaults to your installed Chrome Stable executable, not Chrome for Testing entries from `browser-paths.properties`. On Windows the default lookup checks:
+
+```text
+C:\Program Files\Google\Chrome\Application\chrome.exe
+C:\Program Files (x86)\Google\Chrome\Application\chrome.exe
+```
+
+The console-diff runner also defaults to headed mode so the browser is not headless. Set `CONSOLE_DIFF_HEADLESS=true` only if you intentionally want headless diagnostics.
+Before collecting signals, the runner waits for `networkidle` when possible and then waits 5 seconds by default. Override with `CONSOLE_DIFF_POST_LOAD_WAIT_MS` if a page needs more time.
+
+Evidence is written to:
+
+```text
+evidence/console-diff/<timestamp>/
+```
+
+Each run writes raw `console-values.json` files plus:
+
+- `console-diff-report.json`
+- `console-diff-report.md`
+
+The Markdown report starts with a `Calls And Browser-Only Signals` table for each URL, showing normalized Chase/Akamai/resource calls and other signals found only in Comet or only in Chrome.
+Values that exist in both browsers but change across requests, such as hash cookies, session IDs, timing data, or resource query strings, are documented as volatile and are not treated as browser attribution evidence.
+The raw JSON includes broad signal inventories across navigator, window, document, screen, location, history, performance, crypto, CSS, Intl, Chrome globals, DOM prototypes, WebGL/WebGPU, media, permissions, storage, fonts, and Chase/DFS globals. The Markdown report summarizes the most useful browser-only differences.
+
+Current console-diff signal list:
+
+```text
+location.href
+document.title
+document.readyState
+navigator.userAgent
+navigator.webdriver
+navigator.platform
+navigator.vendor
+navigator.language
+navigator.languages
+navigator.cookieEnabled
+navigator.hardwareConcurrency
+navigator.deviceMemory
+navigator.maxTouchPoints
+navigator.pdfViewerEnabled
+navigator.doNotTrack
+navigator.globalPrivacyControl
+navigator.connection
+navigator.brave
+navigator.plugins
+navigator.mimeTypes
+navigator.userAgentData
+navigator.userAgentData.highEntropy
+navigator.permissions.states
+navigator.mediaDevices.enumerateDevices
+navigator.storage.estimate
+navigator.storage.persisted
+screen
+window.devicePixelRatio
+window.chrome
+window.browserGlobals
+window.featureSupport
+browser.capabilityMatrix
+window.objectInventories
+window.prototypeInventories
+document.policyAndSecurity
+document.dimensions
+css.supports
+css.mediaQueries
+Intl.DateTimeFormat.timeZone
+Intl.DateTimeFormat.locale
+Intl.supportedValues
+performance.memory
+permissions.notifications
+mediaCapabilities.decodingInfo
+audioContext.sampleRate
+webrtc.rtcConfiguration
+webgpu.adapter
+battery.status
+fonts.checks
+fonts.measurements
+speechSynthesis.voices
+speechSynthesis.state
+media.support
+navigator.keyboard
+navigator.gamepads
+navigator.maxTouchPoints.detail
+credential.payment.shareCapabilities
+locale.formatSamples
+headers.clientHintsMeta
+document.cookie.dfs
+localStorage.keys
+sessionStorage.keys
+webgl
+webgl2
+canvas.sample
+performance.navigation
+performance.chaseResources
+window.probedKeys
+window.FingerprintData.getFingerPrint
+```
+
+Optional overrides:
+
+```powershell
+$env:CONSOLE_DIFF_URLS='https://secure.chase.com,https://www.chase.com'
+$env:CONSOLE_DIFF_BROWSERS='comet,chrome'
+$env:CONSOLE_DIFF_CHROME_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
+$env:CONSOLE_DIFF_HEADLESS='false'
+$env:CONSOLE_DIFF_POST_LOAD_WAIT_MS='5000'
+npm run console:diff
+```
+
+To intentionally use the latest configured Chrome path from `browser-paths.properties` instead of installed Chrome Stable:
+
+```powershell
+$env:CONSOLE_DIFF_CHROME_SOURCE='browser-paths'
+npm run console:diff
+```
+
 ## Evidence Output
 
 Evidence is written to:
@@ -206,6 +339,16 @@ Evidence is written to:
 ```text
 evidence/<releaseversion>/<browser>/<browserversion>/
 ```
+
+The aggregate files below are written when the run starts, refreshed after each browser finishes, and finalized at completion. You can refresh `cover-report.html` while the test is running to watch progress.
+
+```text
+evidence/<releaseversion>/summary-report.json
+evidence/<releaseversion>/cover-report.html
+evidence/<releaseversion>/portable-evidence.txt
+```
+
+`portable-evidence.txt` is a compact single-file text report with browser/version, fingerprint values, DFS cookies, and each test's pass/fail status.
 
 Each browser/version run may include:
 
