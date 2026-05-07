@@ -148,11 +148,13 @@ DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
-DFS_E7_BIT22_EXPECTED_1_BROWSERS=opera
+DFS_E7_CLIENT_HINTS_MISSING_BROWSERS=opera
 POST_LOAD_WAIT_MS=2000
 ```
 
 Keep `HEADLESS=true` for request-capture flows where headed browser automation changes or blocks the requests being tested. Use headed mode only for visual debugging.
+
+Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for browser keys that are expected not to provide client hints such as `sec-ch-ua` / `sec-ch-ua-full-version-list`. For those browsers, `dfs_E_7` bit 16 and bit 22 are both expected to be `1`. The older `DFS_E7_BIT22_EXPECTED_1_BROWSERS` and `CLIENT_HINTS_MISSING_BROWSERS` names are still accepted as aliases.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -360,6 +362,7 @@ Each browser/version run may include:
 - `cookies-after-submit.json`
 - `network-login-request.json`
 - `fingerprint-values.txt`
+- `scar-bit16-failure-signals.json`
 - `summary-report.json`
 - `screenshots/*.png`
 
@@ -380,7 +383,8 @@ evidence/<releaseversion>/summary-report.json
 - `dfs_E_6` browser detection format and consistency
 - `dfs_E_7` SCAR bit expectations
   - bit 0 defaults to `1` for Playwright-launched webdriver sessions
-  - bits 1, 16, 22, 25, 26, and 27 default to `0`
+  - bit 16 and bit 22 default to `0`, unless the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
+  - bits 1, 25, 26, and 27 default to `0`
 - `dfs_E_1` non-incognito expectation
 - `dfs_B*`, `dfs_D*`, `dfs_I*`, `dfs_M*`, and `dfs_N*` payload availability
 - Optional mouse movement and `dfs_F_2` comparison

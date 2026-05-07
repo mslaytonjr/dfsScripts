@@ -262,6 +262,329 @@ async function getBrowserDetectionFailureSignals(page) {
   });
 }
 
+async function getScarBit16FailureSignals(page) {
+  return page.evaluate(async () => {
+    function readWindowValue(name) {
+      const present = Object.prototype.hasOwnProperty.call(window, name) || name in window;
+      const value = present ? window[name] : undefined;
+      return {
+        present,
+        type: typeof value,
+        value: typeof value === 'function' ? `[function ${value.name || 'anonymous'}]` : value,
+      };
+    }
+
+    function readDescriptor(object, property) {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(object, property);
+        if (!descriptor) return { present: false };
+        return {
+          present: true,
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          writable: Object.prototype.hasOwnProperty.call(descriptor, 'writable') ? descriptor.writable : undefined,
+          hasGetter: typeof descriptor.get === 'function',
+          hasSetter: typeof descriptor.set === 'function',
+          valueType: Object.prototype.hasOwnProperty.call(descriptor, 'value') ? typeof descriptor.value : 'accessor',
+        };
+      } catch (error) {
+        return { present: false, error: error.message };
+      }
+    }
+
+    async function readPermissionStates() {
+      if (!navigator.permissions || typeof navigator.permissions.query !== 'function') return null;
+      const names = ['notifications', 'geolocation', 'camera', 'microphone', 'clipboard-read', 'clipboard-write', 'persistent-storage'];
+      const states = {};
+      for (const name of names) {
+        try {
+          states[name] = (await navigator.permissions.query({ name })).state;
+        } catch (error) {
+          states[name] = `[error: ${error.message}]`;
+        }
+      }
+      return states;
+    }
+
+    function safeResources(pattern) {
+      try {
+        return performance.getEntriesByType('resource')
+          .filter((entry) => pattern.test(entry.name))
+          .map((entry) => ({
+            name: entry.name,
+            initiatorType: entry.initiatorType,
+            transferSize: entry.transferSize,
+            encodedBodySize: entry.encodedBodySize,
+            decodedBodySize: entry.decodedBodySize,
+          }));
+      } catch (error) {
+        return [{ error: error.message }];
+      }
+    }
+
+    function isPlatformMismatch(uaLow, pfLow) {
+      const platformPatterns = [
+        { prefix: 'macos', pattern: /macintosh|mac os x|macos/ },
+        { prefix: 'windows', pattern: /windows/ },
+        { prefix: 'win', pattern: /windows/ },
+        { prefix: 'android', pattern: /android/ },
+        { prefix: 'ios', pattern: /iphone|ipad|ipod|ios/ },
+        { prefix: 'chrome os', pattern: /cros|chrome os/ },
+        { prefix: 'chromeos', pattern: /cros|chrome os/ },
+        { prefix: 'linux', pattern: /linux/ },
+      ];
+      const match = platformPatterns.find((item) => pfLow === item.prefix || pfLow.startsWith(`${item.prefix} `));
+      if (match) return !match.pattern.test(uaLow);
+      return !uaLow.includes(pfLow);
+    }
+
+    function getWebglSpoofSignals() {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) {
+          return {
+            available: false,
+            renderer: '',
+            vendor: '',
+            score: 0,
+            triggered: false,
+            reason: 'No WebGL context; UASpoof _scoreWebGLAnomaly returns 0 when gl is unavailable.',
+          };
+        }
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '';
+        const vendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : '';
+        const swiftShader = /SwiftShader/i.test(renderer);
+        const unknownVendor = !/NVIDIA|AMD|Intel|Apple|Mesa|ANGLE/i.test(renderer);
+        return {
+          available: true,
+          renderer,
+          vendor,
+          swiftShader,
+          unknownVendor,
+          score: swiftShader ? 20 : unknownVendor ? 10 : 0,
+          triggered: swiftShader || unknownVendor,
+          reason: swiftShader
+            ? 'Renderer contains SwiftShader.'
+            : unknownVendor
+              ? 'Renderer does not match NVIDIA/AMD/Intel/Apple/Mesa/ANGLE.'
+              : 'Renderer is recognized by UASpoof.',
+        };
+      } catch (error) {
+        return {
+          available: false,
+          error: error.message,
+          score: 0,
+          triggered: false,
+        };
+      }
+    }
+
+    function scoreUASpoofBreakdown(ua, pf, lang, tz, ch) {
+      const brands = Array.isArray(ch && ch.brands) ? ch.brands : [];
+      const fullVersionList = Array.isArray(ch && ch.fullVersionList) ? ch.fullVersionList : [];
+      const emptyBrands = ch ? Array.isArray(ch.brands) && ch.brands.length === 0 : false;
+      const emptyVersions = ch ? Array.isArray(ch.fullVersionList) && ch.fullVersionList.length === 0 : false;
+      const emptyPlatform = ch ? !ch.platform || ch.platform === '' : false;
+      const emptyHintsScore = ch && (emptyBrands || emptyVersions || emptyPlatform) ? 50 : 0;
+
+      const uaMatch = ua.match(/Chrome\/(\d+)/i);
+      const chMatch = fullVersionList.length > 0 ? fullVersionList[0].version?.match(/(\d+)/) : null;
+      const versionMismatch = Boolean(uaMatch && chMatch && uaMatch[1] !== chMatch[1]);
+      const platformMismatch = Boolean(ch && ch.platform && isPlatformMismatch(ua.toLowerCase(), ch.platform.toLowerCase()));
+      const hintsMismatchScore = (versionMismatch ? 40 : 0) + (platformMismatch ? 40 : 0);
+
+      const appleSignature = !/Mac|iPhone|iPad|iOS|Safari/.test(ua) && /Apple|Heisei|Macintosh|Darwin|CoreAnimation|Metal/i.test(ua + pf);
+      const webgl = getWebglSpoofSignals();
+      const brandStr = JSON.stringify(brands);
+      const brandQuirk = /Windows/i.test(ua) && brandStr.includes('Not?A_Brand');
+      const localeTzEnUsOutsideAmerica = lang.startsWith('en-US') && /Asia|Europe|Africa/.test(tz);
+      const localeTzNonEnAmerica = !lang.startsWith('en') && /America|US/.test(tz);
+      const localeTzScore = (localeTzEnUsOutsideAmerica ? 25 : 0) + (localeTzNonEnAmerica ? 25 : 0);
+
+      const checks = {
+        emptyHints: {
+          score: emptyHintsScore,
+          triggered: emptyHintsScore > 0,
+          emptyBrands,
+          emptyVersions,
+          emptyPlatform,
+          scarFlag: 'UA_CH_EMPTY',
+        },
+        hintsVersionMismatch: {
+          score: versionMismatch ? 40 : 0,
+          triggered: versionMismatch,
+          uaChromeMajor: uaMatch ? uaMatch[1] : null,
+          firstFullVersionListMajor: chMatch ? chMatch[1] : null,
+          firstFullVersionListEntry: fullVersionList[0] || null,
+          scarFlag: 'UA_CH_VER_MISMATCH',
+        },
+        hintsPlatformMismatch: {
+          score: platformMismatch ? 40 : 0,
+          triggered: platformMismatch,
+          uaLower: ua.toLowerCase(),
+          clientHintsPlatform: ch && ch.platform ? ch.platform : null,
+          scarFlag: 'UA_CH_PLATFORM_MISMATCH',
+        },
+        appleSignatures: {
+          score: appleSignature ? 30 : 0,
+          triggered: appleSignature,
+          ua,
+          platform: pf,
+          scarFlag: 'UA_APPLE_SIG',
+        },
+        webglAnomaly: {
+          ...webgl,
+          scarFlag: 'UA_WEBGL_ANOMALY',
+        },
+        windowsNotABrandQuirk: {
+          score: brandQuirk ? 8 : 0,
+          triggered: brandQuirk,
+          brandStr,
+          exactNeedle: 'Not?A_Brand',
+          note: 'The current UASpoof source checks for Not?A_Brand with a question mark.',
+          scarFlag: 'UA_BRAND_NOTABRAND',
+        },
+        localeTimezone: {
+          score: localeTzScore,
+          triggered: localeTzScore > 0,
+          language: lang,
+          timeZone: tz,
+          enUsOutsideAmerica: localeTzEnUsOutsideAmerica,
+          nonEnglishInAmerica: localeTzNonEnAmerica,
+          scarFlag: 'UA_LOCALE_TZ_WEIRD',
+        },
+      };
+
+      const totalScore = Object.values(checks).reduce((sum, item) => sum + (Number(item.score) || 0), 0);
+      return {
+        sourceReviewed: '.ignore/dfs.js UASpoof()',
+        scoreRule: 'UA_SPOOF bit16 is set when UASpoof score > 0.',
+        inputs: {
+          ua,
+          platform: pf,
+          language: lang,
+          timeZone: tz,
+          clientHints: ch,
+        },
+        checks,
+        totalScore,
+        triggeredScarFlags: Object.values(checks)
+          .filter((item) => item.triggered && item.scarFlag)
+          .map((item) => item.scarFlag),
+        bit16ExpectedFromScore: totalScore > 0 ? '1' : '0',
+      };
+    }
+
+    const automationLikeWindowKeys = Object.keys(window)
+      .filter((key) => /webdriver|selenium|playwright|puppeteer|cdc_|driver|automation/i.test(key))
+      .sort()
+      .map((key) => ({ key, type: typeof window[key] }));
+
+    const highEntropyUserAgentData = navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function'
+      ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList', 'platform', 'platformVersion', 'architecture', 'bitness', 'model', 'uaFullVersion'])
+        .catch((error) => ({ error: error.message }))
+      : null;
+    const uaSpoofClientHints = navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function'
+      ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList', 'platform'])
+        .catch(() => null)
+      : null;
+    const ua = navigator.userAgent || '';
+    const pf = navigator.platform || '';
+    const lang = navigator.language || '';
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    const uaSpoofBreakdown = scoreUASpoofBreakdown(ua, pf, lang, tz, uaSpoofClientHints);
+
+    return {
+      capturedAt: new Date().toISOString(),
+      reason: 'Captured because dfs_E_7 bit16 was expected 0 but observed 1.',
+      uaSpoofBreakdown,
+      navigatorSignals: {
+        userAgent: ua,
+        webdriver: navigator.webdriver,
+        webdriverPresent: 'webdriver' in navigator,
+        webdriverDescriptorOnNavigator: readDescriptor(navigator, 'webdriver'),
+        webdriverDescriptorOnPrototype: readDescriptor(Object.getPrototypeOf(navigator), 'webdriver'),
+        platform: pf,
+        vendor: navigator.vendor,
+        language: lang,
+        timeZone: tz,
+        languages: navigator.languages,
+        cookieEnabled: navigator.cookieEnabled,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        deviceMemory: navigator.deviceMemory,
+        maxTouchPoints: navigator.maxTouchPoints,
+        pdfViewerEnabled: navigator.pdfViewerEnabled,
+        doNotTrack: navigator.doNotTrack,
+        globalPrivacyControlPresent: 'globalPrivacyControl' in navigator || navigator.globalPrivacyControl !== undefined,
+        globalPrivacyControlValue: navigator.globalPrivacyControl,
+      },
+      userAgentData: {
+        lowEntropy: navigator.userAgentData && typeof navigator.userAgentData.toJSON === 'function'
+          ? navigator.userAgentData.toJSON()
+          : null,
+        highEntropy: highEntropyUserAgentData,
+      },
+      permissions: await readPermissionStates(),
+      browserGlobals: {
+        chrome: readWindowValue('chrome'),
+        chromeKeys: window.chrome && typeof window.chrome === 'object' ? Object.keys(window.chrome).sort() : [],
+        chromeRuntimePresent: Boolean(window.chrome && window.chrome.runtime),
+        browser: readWindowValue('browser'),
+        opr: readWindowValue('opr'),
+        opera: readWindowValue('opera'),
+        InstallTrigger: readWindowValue('InstallTrigger'),
+        StyleMedia: readWindowValue('StyleMedia'),
+      },
+      automationLikeWindowKeys,
+      documentSignals: {
+        hasFocus: document.hasFocus(),
+        hidden: document.hidden,
+        visibilityState: document.visibilityState,
+        referrer: document.referrer,
+        domain: document.domain,
+        isSecureContext,
+        crossOriginIsolated,
+      },
+      storageAndCapabilitySignals: {
+        localStorageKeys: (() => {
+          try {
+            return Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)).sort();
+          } catch (error) {
+            return [`[error: ${error.message}]`];
+          }
+        })(),
+        sessionStorageKeys: (() => {
+          try {
+            return Array.from({ length: sessionStorage.length }, (_, index) => sessionStorage.key(index)).sort();
+          } catch (error) {
+            return [`[error: ${error.message}]`];
+          }
+        })(),
+        indexedDBPresent: 'indexedDB' in window,
+        cachesPresent: 'caches' in window,
+        serviceWorkerPresent: 'serviceWorker' in navigator,
+        webgpuPresent: 'gpu' in navigator,
+        webhidPresent: 'hid' in navigator,
+        webusbPresent: 'usb' in navigator,
+        serialPresent: 'serial' in navigator,
+      },
+      dfsAndTelemetrySignals: {
+        FingerprintData: readWindowValue('FingerprintData'),
+        clientEnvProps: readWindowValue('clientEnvProps'),
+        clientEnvPropsComplete: readWindowValue('clientEnvPropsComplete'),
+        BOOMR_check_doc_domain: readWindowValue('BOOMR_check_doc_domain'),
+        BOOMR_check_domain: readWindowValue('BOOMR_check_domain'),
+        _sentryDebugIdIdentifier: readWindowValue('_sentryDebugIdIdentifier'),
+        bmRM: readWindowValue('bmRM'),
+        dfsJsResources: safeResources(/\/dfs\.js(?:[?#]|$)/i),
+        telemetryResources: safeResources(/dfs|fingerprint|sentry|boomr|boomerang|akamai/i),
+      },
+    };
+  });
+}
+
 async function getBrowserFailureDiagnostics(page) {
   return page.evaluate(async () => {
     async function readExpression(expression, getter) {
@@ -385,9 +708,24 @@ function getExpectedDfsE6(browser) {
   return `${osCode} - ${browserCode}`;
 }
 
+function getBrowsersExpectingMissingClientHints() {
+  return parseSet(
+    process.env.DFS_E7_CLIENT_HINTS_MISSING_BROWSERS ||
+    process.env.DFS_E7_BIT22_EXPECTED_1_BROWSERS ||
+    process.env.CLIENT_HINTS_MISSING_BROWSERS
+  );
+}
+
+function expectsMissingClientHints(browser) {
+  return getBrowsersExpectingMissingClientHints().has(String(browser || '').toLowerCase());
+}
+
+function getExpectedDfsE7Bit16(browser, notABrandQuestionMarkSignal) {
+  return expectsMissingClientHints(browser) || Boolean(notABrandQuestionMarkSignal && notABrandQuestionMarkSignal.triggered) ? '1' : '0';
+}
+
 function getExpectedDfsE7Bit22(browser) {
-  const browsersExpectingMissingClientHints = parseSet(process.env.DFS_E7_BIT22_EXPECTED_1_BROWSERS || process.env.CLIENT_HINTS_MISSING_BROWSERS);
-  return browsersExpectingMissingClientHints.has(String(browser || '').toLowerCase()) ? '1' : '0';
+  return expectsMissingClientHints(browser) ? '1' : '0';
 }
 
 function matcherFromConfig(value) {
@@ -404,6 +742,48 @@ function matcherFromConfig(value) {
 
 function isHttpUrl(value) {
   return /^https?:\/\//i.test(value);
+}
+
+async function getNotABrandQuestionMarkSignal(page) {
+  return page.evaluate(async () => {
+    function normalizeBrand(value) {
+      return String(value || '').replace(/[^a-z]/gi, '').toLowerCase();
+    }
+
+    function collectBrands(source, items) {
+      if (!Array.isArray(items)) return [];
+      return items
+        .map((item) => ({
+          source,
+          brand: item && item.brand !== undefined ? String(item.brand) : '',
+          version: item && item.version !== undefined ? String(item.version) : undefined,
+        }))
+        .filter((item) => item.brand);
+    }
+
+    const lowEntropy = navigator.userAgentData && typeof navigator.userAgentData.toJSON === 'function'
+      ? navigator.userAgentData.toJSON()
+      : null;
+    const highEntropy = navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function'
+      ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList'])
+        .catch((error) => ({ error: error.message }))
+      : null;
+    const brandEntries = [
+      ...collectBrands('lowEntropy.brands', lowEntropy && lowEntropy.brands),
+      ...collectBrands('highEntropy.brands', highEntropy && highEntropy.brands),
+      ...collectBrands('highEntropy.fullVersionList', highEntropy && highEntropy.fullVersionList),
+    ];
+    const matches = brandEntries.filter((entry) => entry.brand.includes('?') && normalizeBrand(entry.brand) === 'notabrand');
+
+    return {
+      triggered: matches.length > 0,
+      matches,
+      brandEntries,
+      lowEntropy,
+      highEntropy,
+      rule: 'Expect dfs_E_7 bit16 to be 1 when a Not A Brand client-hints brand contains "?".',
+    };
+  });
 }
 
 function isDfsJsUrl(value) {
@@ -1368,13 +1748,17 @@ async function runTarget(target, config) {
 
     const e7 = String(initialCookieMap.dfs_E_7 || getFingerprintValue(initialFingerprint, 'dfs_E_7') || '');
     const expectedWebdriverBit0 = readString('EXPECTED_DFS_E7_BIT0', '1');
+    const expectedMissingClientHints = expectsMissingClientHints(target.browser);
+    const notABrandQuestionMarkSignal = await runStep('read Not A Brand client-hints signal', () => getNotABrandQuestionMarkSignal(page));
     const scarBits = {
       dfs_E_7: e7,
       indexing: 'zero-based; bit 0 is the first character',
+      expectedMissingClientHints,
+      notABrandQuestionMarkSignal,
       expectations: {
         bit0: expectedWebdriverBit0,
         bit1: '0',
-        ...(readBoolean('IGNORE_DFS_E7_BIT16', false) ? {} : { bit16: '0' }),
+        ...(readBoolean('IGNORE_DFS_E7_BIT16', false) ? {} : { bit16: getExpectedDfsE7Bit16(target.browser, notABrandQuestionMarkSignal) }),
         bit22: getExpectedDfsE7Bit22(target.browser),
         bit25: '0',
         bit26: '0',
@@ -1388,11 +1772,18 @@ async function runTarget(target, config) {
       bit26: getBitValue(e7, 26),
       bit27: getBitValue(e7, 27),
     };
-    const scarFile = saveJson(path.join(outputDir, 'scar-bit-evaluation.json'), scarBits);
+    const bit16Expected = scarBits.expectations.bit16;
+    let scarBit16FailureSignalsFile = null;
+    if (bit16Expected !== undefined && bit16Expected !== scarBits.bit16 && scarBits.bit16 === '1') {
+      scarBits.bit16FailureSignals = await runStep('read SCAR bit16 failure signals', () => getScarBit16FailureSignals(page));
+      scarBit16FailureSignalsFile = saveJson(path.join(outputDir, 'scar-bit16-failure-signals.json'), scarBits.bit16FailureSignals);
+    }
+    const scarEvidenceFiles = [saveJson(path.join(outputDir, 'scar-bit-evaluation.json'), scarBits)];
+    if (scarBit16FailureSignalsFile) scarEvidenceFiles.push(scarBit16FailureSignalsFile);
     const scarFailures = Object.entries(scarBits.expectations)
       .filter(([key, expectedValue]) => scarBits[key] !== expectedValue)
       .map(([key, expectedValue]) => `${key} expected ${expectedValue}, got ${scarBits[key]}`);
-    addResult(results, 'AI Score / SCAR Testing', scarFailures.length === 0 ? 'PASS' : 'FAIL', scarBits, [scarFile], scarFailures);
+    addResult(results, 'AI Score / SCAR Testing', scarFailures.length === 0 ? 'PASS' : 'FAIL', scarBits, scarEvidenceFiles, scarFailures);
 
     const privateMode = { dfs_E_1: getFingerprintValue(initialFingerprint, 'dfs_E_1') };
     const privateModeFile = saveJson(path.join(outputDir, 'private-mode.json'), privateMode);
