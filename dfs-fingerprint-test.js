@@ -129,6 +129,26 @@ function getLaunchOptions(target) {
   return options;
 }
 
+function getPrivateModeLaunchOptions(target) {
+  const options = getLaunchOptions(target);
+  if (target.browser === 'firefox') {
+    return {
+      ...options,
+      firefoxUserPrefs: {
+        ...(options.firefoxUserPrefs || {}),
+        'browser.privatebrowsing.autostart': true,
+      },
+    };
+  }
+  if (['chrome', 'edge', 'opera', 'comet', 'atlas'].includes(target.browser)) {
+    return {
+      ...options,
+      args: [...(options.args || []), '--incognito'],
+    };
+  }
+  return null;
+}
+
 function usesBundledFirefox(target) {
   return target.browser === 'firefox' && readBoolean('FIREFOX_USE_PLAYWRIGHT_BUNDLED', true);
 }
@@ -1077,6 +1097,439 @@ async function maybeMoveMouse(page) {
   }
 }
 
+async function maybeTeleportMouse(page) {
+  const viewport = page.viewportSize() || { width: 1280, height: 720 };
+  const points = [
+    [5, 5],
+    [Math.max(10, viewport.width - 10), Math.max(10, viewport.height - 10)],
+    [Math.floor(viewport.width * 0.1), Math.floor(viewport.height * 0.85)],
+    [Math.floor(viewport.width * 0.9), Math.floor(viewport.height * 0.15)],
+  ];
+
+  for (const [x, y] of points) {
+    await page.mouse.move(x, y, { steps: 1 });
+    await page.waitForTimeout(5);
+  }
+}
+
+function getScenarioText(name) {
+  return readString(`${name}_VALUE`, readString('INTERACTION_TEST_VALUE', 'testuser1'));
+}
+
+function getInteractionScenarioNames() {
+  return parseList(readString(
+    'INTERACTION_TEST_SCENARIOS',
+    'human_typing,bot_fast_typing,paste,programmatic_input,mouse_teleport,low_mouse_activity,focus_input_speed,scroll_click_pattern,payload_coverage'
+  ));
+}
+
+function getBehaviorBitExpectations(scenarioName) {
+  const expectations = {
+    human_typing: { bit25: '0', bit26: '0', bit27: '0', bit28: '0' },
+    bot_fast_typing: { bit21: '1', bit25: '1' },
+    paste: { bit21: '1', bit27: '1' },
+    programmatic_input: { bit21: '1', bit26: '1' },
+    mouse_teleport: { bit21: '1', bit28: '1' },
+    low_mouse_activity: { bit21: '1', bit29: '1' },
+    focus_input_speed: { bit21: '1', bit30: '1' },
+    scroll_click_pattern: { bit31: '1' },
+  };
+  return expectations[scenarioName] || {};
+}
+
+function getInputInteractionConfig() {
+  return {
+    usernameSelector: readString('USERNAME_SELECTOR'),
+    passwordSelector: readString('PASSWORD_SELECTOR'),
+    submitSelector: readString('SUBMIT_SELECTOR'),
+  };
+}
+
+async function getScenarioRoot(page) {
+  const frameSelector = process.env.LOGIN_FRAME_SELECTOR;
+  const frame = getLoginFrame(page);
+  if (frame) return frame;
+  if (frameSelector) return page.frameLocator(frameSelector);
+  return page;
+}
+
+async function getFieldIdentity(locator) {
+  return locator.evaluate((el) => ({
+    id: el.id || '',
+    name: el.getAttribute('name') || '',
+    type: el.getAttribute('type') || el.tagName.toLowerCase(),
+    tagName: el.tagName,
+  }));
+}
+
+async function fillWithHumanTyping(page, root, selector, value) {
+  const field = root.locator(selector);
+  await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await field.click();
+  for (const char of String(value)) {
+    await page.keyboard.type(char, { delay: 80 + Math.floor(Math.random() * 90) });
+  }
+}
+
+async function fillWithFastTyping(page, root, selector, value) {
+  const field = root.locator(selector);
+  await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await field.click();
+  await page.keyboard.type(String(value), { delay: Number(process.env.BOT_TYPE_DELAY_MS || 20) });
+}
+
+async function pasteIntoField(page, root, selector, value) {
+  const field = root.locator(selector);
+  await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await field.click();
+  const text = String(value);
+  const clipboardWritten = await page.evaluate(async (nextValue) => {
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') return false;
+      await navigator.clipboard.writeText(nextValue);
+      return true;
+    } catch {
+      return false;
+    }
+  }, text);
+
+  if (clipboardWritten) {
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V');
+  } else {
+    await field.evaluate((el, nextValue) => {
+      const data = new DataTransfer();
+      data.setData('text/plain', nextValue);
+      el.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, clipboardData: data }));
+      el.value = nextValue;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: nextValue }));
+    }, text);
+  }
+}
+
+async function setProgrammaticInput(root, selector, value) {
+  const field = root.locator(selector);
+  await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await field.evaluate((el, nextValue) => {
+    el.value = nextValue;
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue }));
+  }, String(value));
+}
+
+async function triggerBehaviorScore(page) {
+  await page.evaluate(() => {
+    const button = document.createElement('button');
+    button.type = 'submit';
+    button.id = 'submit';
+    button.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;';
+    document.body.appendChild(button);
+    button.click();
+    button.remove();
+  });
+  await page.waitForTimeout(Number(process.env.INTERACTION_SCORE_WAIT_MS || 750));
+}
+
+async function readBehaviorState(page) {
+  const cookies = parseCookieArray(await getDfsCookies(page));
+  const fingerprint = await getFingerprint(page);
+  const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+  return {
+    cookies,
+    fingerprint,
+    dfs_E_5: cookies.dfs_E_5 || getFingerprintValue(fingerprint, 'dfs_E_5'),
+    dfs_E_7: e7,
+    dfs_F_2: cookies.dfs_F_2 || getFingerprintValue(fingerprint, 'dfs_F_2'),
+    bits: {
+      bit21: getBitValue(e7, 21),
+      bit25: getBitValue(e7, 25),
+      bit26: getBitValue(e7, 26),
+      bit27: getBitValue(e7, 27),
+      bit28: getBitValue(e7, 28),
+      bit29: getBitValue(e7, 29),
+      bit30: getBitValue(e7, 30),
+      bit31: getBitValue(e7, 31),
+    },
+  };
+}
+
+async function performInteractionScenario(page, scenarioName) {
+  const config = getInputInteractionConfig();
+  const root = await getScenarioRoot(page);
+  const username = getScenarioText('USERNAME');
+  const password = getScenarioText('PASSWORD');
+  const needsInput = ['human_typing', 'bot_fast_typing', 'paste', 'programmatic_input', 'focus_input_speed'].includes(scenarioName);
+
+  if (needsInput && !config.usernameSelector) {
+    return {
+      skipped: true,
+      reason: 'USERNAME_SELECTOR is required for this interaction scenario.',
+      requiredConfig: ['USERNAME_SELECTOR'],
+    };
+  }
+
+  switch (scenarioName) {
+    case 'human_typing':
+      await maybeMoveMouse(page);
+      await fillWithHumanTyping(page, root, config.usernameSelector, username);
+      if (config.passwordSelector) await fillWithHumanTyping(page, root, config.passwordSelector, password);
+      break;
+    case 'bot_fast_typing':
+      await maybeMoveMouse(page);
+      await fillWithFastTyping(page, root, config.usernameSelector, username);
+      if (config.passwordSelector) await fillWithFastTyping(page, root, config.passwordSelector, password);
+      break;
+    case 'paste':
+      await maybeMoveMouse(page);
+      await pasteIntoField(page, root, config.usernameSelector, username);
+      break;
+    case 'programmatic_input':
+      await maybeMoveMouse(page);
+      await setProgrammaticInput(root, config.usernameSelector, username);
+      await page.waitForTimeout(Number(process.env.PROGRAMMATIC_INPUT_POLL_WAIT_MS || 500));
+      break;
+    case 'mouse_teleport':
+      await maybeTeleportMouse(page);
+      break;
+    case 'low_mouse_activity':
+      break;
+    case 'focus_input_speed': {
+      const field = root.locator(config.usernameSelector);
+      await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+      const identity = await getFieldIdentity(field);
+      const focusKey = identity.name || identity.id || identity.tagName;
+      if (!['username', 'password'].includes(String(focusKey || '').toLowerCase())) {
+        return {
+          skipped: true,
+          reason: 'DFS focus-speed scoring only checks focused controls named or identified as username/password.',
+          fieldIdentity: identity,
+        };
+      }
+      await maybeMoveMouse(page);
+      await field.click();
+      await page.keyboard.type(username, { delay: 10 });
+      break;
+    }
+    case 'scroll_click_pattern':
+      for (let index = 0; index < 5; index += 1) {
+        await page.mouse.click(100 + index * 12, 100 + index * 8);
+        await page.waitForTimeout(50);
+      }
+      for (let index = 0; index < 5; index += 1) {
+        await page.mouse.wheel(0, 180);
+        await page.waitForTimeout(50);
+      }
+      break;
+    case 'payload_coverage':
+      await maybeMoveMouse(page);
+      await page.mouse.click(120, 120);
+      await page.mouse.dblclick(140, 140);
+      await page.mouse.click(160, 160, { button: 'right' });
+      await page.mouse.wheel(0, 250);
+      await page.evaluate(() => window.scrollBy(0, 250));
+      if (config.usernameSelector) {
+        await fillWithHumanTyping(page, root, config.usernameSelector, username);
+        await pasteIntoField(page, root, config.usernameSelector, `${username}2`);
+      }
+      break;
+    default:
+      return {
+        skipped: true,
+        reason: `Unknown interaction scenario: ${scenarioName}`,
+      };
+  }
+
+  await triggerBehaviorScore(page);
+  return { skipped: false };
+}
+
+async function runInteractionScenario(browser, target, config, outputDir, results, scenarioName) {
+  const scenarioSlug = sanitizeSegment(scenarioName);
+  let scenarioContext;
+  let scenarioPage;
+  try {
+    scenarioContext = await runStep(`create ${scenarioName} interaction context`, () => browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    }));
+    await runStep(`install ${scenarioName} script override`, () => installScriptOverride(scenarioContext, outputDir));
+    scenarioPage = await runStep(`open ${scenarioName} interaction page`, () => scenarioContext.newPage());
+    await runStep(`navigate ${scenarioName} interaction page`, () => scenarioPage.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    }));
+    await runStep(`${scenarioName} post-load wait`, () => scenarioPage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+
+    const before = await runStep(`read ${scenarioName} baseline behavior state`, () => readBehaviorState(scenarioPage));
+    const performed = await runStep(`perform ${scenarioName} interaction scenario`, () => performInteractionScenario(scenarioPage, scenarioName));
+    if (performed.skipped) {
+      addResult(
+        results,
+        `Interaction Scenario - ${scenarioName}`,
+        'SKIP',
+        performed,
+        [],
+        [performed.reason]
+      );
+      return;
+    }
+    const after = await runStep(`read ${scenarioName} behavior state`, () => readBehaviorState(scenarioPage));
+    const debugLog = await runStep(`read ${scenarioName} dfs_E_5 debug log`, () => getDfsE5DebugLog(scenarioPage));
+    const expectations = getBehaviorBitExpectations(scenarioName);
+    const bitFailures = Object.entries(expectations)
+      .filter(([key, expected]) => after.bits[key] !== expected)
+      .map(([key, expected]) => `${key} expected ${expected}, got ${after.bits[key]}`);
+    const f2Changed = before.dfs_F_2 !== undefined && after.dfs_F_2 !== undefined && String(before.dfs_F_2) !== String(after.dfs_F_2);
+    const payloadFailure = scenarioName === 'payload_coverage' && !f2Changed ? ['dfs_F_2 did not change after payload coverage interactions'] : [];
+    const evidence = {
+      scenario: scenarioName,
+      browser: target.browser,
+      before: {
+        dfs_E_5: before.dfs_E_5,
+        dfs_E_7: before.dfs_E_7,
+        dfs_F_2: before.dfs_F_2,
+        bits: before.bits,
+      },
+      after: {
+        dfs_E_5: after.dfs_E_5,
+        dfs_E_7: after.dfs_E_7,
+        dfs_F_2: after.dfs_F_2,
+        bits: after.bits,
+      },
+      expectations,
+      f2Changed,
+      debugLog,
+    };
+    const evidenceFile = saveJson(path.join(outputDir, `interaction-${scenarioSlug}.json`), evidence);
+    addResult(
+      results,
+      `Interaction Scenario - ${scenarioName}`,
+      bitFailures.length === 0 && payloadFailure.length === 0 ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      [...bitFailures, ...payloadFailure]
+    );
+  } catch (error) {
+    addResult(
+      results,
+      `Interaction Scenario - ${scenarioName}`,
+      'FAIL',
+      { scenario: scenarioName, error: error.message },
+      [],
+      [error]
+    );
+  } finally {
+    if (scenarioPage && !scenarioPage.isClosed()) await closeWithTimeout(`${scenarioName} page`, () => scenarioPage.close());
+    if (scenarioContext) await closeWithTimeout(`${scenarioName} context`, () => scenarioContext.close());
+  }
+}
+
+async function runInteractionScenarioTests(browser, target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_INTERACTION_SCENARIO_TESTS', true)) {
+    addResult(
+      results,
+      'Interaction Scenario Tests',
+      'SKIP',
+      { reason: 'PERFORM_INTERACTION_SCENARIO_TESTS=false; interaction scenarios skipped by configuration.' },
+      [],
+      ['Interaction scenario tests skipped by configuration.']
+    );
+    return;
+  }
+
+  for (const scenarioName of getInteractionScenarioNames()) {
+    await runInteractionScenario(browser, target, config, outputDir, results, scenarioName);
+  }
+}
+
+async function runPrivateModeBrowserTest(target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', true)) {
+    addResult(
+      results,
+      'Private / Incognito Browser Mode Launch',
+      'SKIP',
+      { reason: 'PERFORM_PRIVATE_MODE_BROWSER_TEST=false; private/incognito browser launch skipped by configuration.' },
+      [],
+      ['Private/incognito browser mode launch skipped by configuration.']
+    );
+    return;
+  }
+
+  const launchOptions = getPrivateModeLaunchOptions(target);
+  if (!launchOptions) {
+    addResult(
+      results,
+      'Private / Incognito Browser Mode Launch',
+      'SKIP',
+      {
+        browser: target.browser,
+        reason: 'This runner does not have a reliable private/incognito launch strategy for this browser target.',
+        supportedTargets: ['chrome', 'edge', 'opera', 'comet', 'atlas', 'firefox'],
+      },
+      [],
+      [`Private/incognito launch is not supported for ${target.browser}.`]
+    );
+    return;
+  }
+
+  const browserType = getBrowserType(target.browser);
+  let privateBrowser;
+  let privateContext;
+  let privatePage;
+
+  try {
+    privateBrowser = await runStep('launch private/incognito browser', () => browserType.launch(launchOptions));
+    privateContext = await runStep('create private/incognito context', () => privateBrowser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    }));
+    await runStep('install private/incognito script override', () => installScriptOverride(privateContext, outputDir));
+    privatePage = await runStep('open private/incognito page', () => privateContext.newPage());
+    await runStep(`navigate private/incognito page to ${config.targetUrl}`, () => privatePage.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    }));
+    await runStep('private/incognito post-load wait', () => privatePage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+    const fingerprint = await runStep('read private/incognito fingerprint', () => getFingerprint(privatePage));
+    await runStep('private/incognito cookie settle wait', () => waitForCookieSettle(privatePage, 'private_mode'));
+    const cookies = parseCookieArray(await runStep('read private/incognito DFS cookies', () => getDfsCookies(privatePage)));
+    const dfsE1 = cookies.dfs_E_1 || getFingerprintValue(fingerprint, 'dfs_E_1');
+    const evidence = {
+      browser: target.browser,
+      launchStrategy: target.browser === 'firefox' ? 'firefoxUserPrefs browser.privatebrowsing.autostart=true' : '--incognito',
+      dfs_E_1: dfsE1,
+      expectedDfs_E_1: '1',
+      cookies,
+      fingerprint,
+      note: 'This validates whether DFS private-mode detection identifies a browser launched through the runner private/incognito strategy.',
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'private-mode-browser-launch.json'), evidence);
+    addResult(
+      results,
+      'Private / Incognito Browser Mode Launch',
+      String(dfsE1) === '1' ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      String(dfsE1) === '1' ? [] : [`dfs_E_1 expected 1 in private/incognito mode, got ${dfsE1}`]
+    );
+  } catch (error) {
+    addResult(
+      results,
+      'Private / Incognito Browser Mode Launch',
+      'FAIL',
+      { browser: target.browser, error: error.message },
+      [],
+      [error]
+    );
+  } finally {
+    if (privatePage && !privatePage.isClosed()) await closeWithTimeout('Private/incognito page', () => privatePage.close());
+    if (privateContext) await closeWithTimeout('Private/incognito context', () => privateContext.close());
+    if (privateBrowser) await closeWithTimeout('Private/incognito browser', () => privateBrowser.close());
+  }
+}
+
 function frameNameFromSelector(selector) {
   const match = String(selector || '').match(/\bname\s*=\s*["']([^"']+)["']/i);
   return match ? match[1] : '';
@@ -1796,6 +2249,8 @@ async function runTarget(target, config) {
       String(privateMode.dfs_E_1) === '0' ? [] : [`dfs_E_1 expected 0, got ${privateMode.dfs_E_1}`]
     );
 
+    await runPrivateModeBrowserTest(target, config, outputDir, results);
+
     const fingerprintValues = extractFingerprintValues(initialFingerprint);
     const fingerprintValuesText = Object.keys(fingerprintValues).sort().map((key) => `${key}=${fingerprintValues[key]}`).join('\n');
     const fingerprintValuesFile = saveText(path.join(outputDir, 'fingerprint-values.txt'), `${fingerprintValuesText}\n`);
@@ -1808,6 +2263,8 @@ async function runTarget(target, config) {
       [fingerprintValuesFile, fingerprintFile],
       missingPrefixes.map((prefix) => `No non-empty key found for ${prefix}*`)
     );
+
+    await runInteractionScenarioTests(browser, target, config, outputDir, results);
 
     const loginBeforeMouse = readBoolean('LOGIN_BEFORE_MOUSE', false);
     let logonValidationRan = false;
