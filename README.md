@@ -148,13 +148,23 @@ DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
+DFS_E7_BIT_SHUFFLE_ENABLED=false
+DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index
 DFS_E7_CLIENT_HINTS_MISSING_BROWSERS=opera
 POST_LOAD_WAIT_MS=2000
+SCRIPT_OVERRIDE_MATCH=/aegis-binaries\/dfs\.js/i
+SCRIPT_OVERRIDE_SOURCE=C:\GitRepo\dfsScripts\.ignore\dfs121beta.js
+LEVO_SCRIPT_OVERRIDE_MATCH=/aegis-binaries\/levo\.js/i
+LEVO_SCRIPT_OVERRIDE_SOURCE=C:\GitRepo\dfsScripts\.ignore\levo.js
 ```
 
 Keep `HEADLESS=true` for request-capture flows where headed browser automation changes or blocks the requests being tested. Use headed mode only for visual debugging.
 
+Use `SCRIPT_OVERRIDE_*` to replace `dfs.js` and `LEVO_SCRIPT_OVERRIDE_*` to replace `levo.js`. Each override needs both a match pattern and a source path or HTTPS URL.
+
 Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for browser keys that are expected not to provide client hints such as `sec-ch-ua` / `sec-ch-ua-full-version-list`. For those browsers, `dfs_E_7` bit 16 and bit 22 are both expected to be `1`. The older `DFS_E7_BIT22_EXPECTED_1_BROWSERS` and `CLIENT_HINTS_MISSING_BROWSERS` names are still accepted as aliases.
+
+Set `DFS_E7_BIT_SHUFFLE_ENABLED=true` when `dfs_E_7` is emitted in shuffled order. The runner derives the shuffle seed from `parseInt(dfs_F_5.slice(0, 8), 16)`, uses Mulberry32 returning a raw uint32, applies descending Fisher-Yates with `rand() % (i + 1)` to `S001` through `S032`, and then evaluates semantic bit numbers against the shuffled positions. `DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index` means semantic bit N reads from the position named by shuffled label N; use `find-label` if semantic bit N is stored where `S00N` landed.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -378,14 +388,17 @@ evidence/<releaseversion>/summary-report.json
 
 - Page load and DFS console errors
 - `window.FingerprintData.getFingerPrint()` or `getFingerprint()`
-- Required DFS cookies on page load
+- Required DFS cookies on page load, including `dfs_E_4`
 - Cookie-to-fingerprint comparisons
 - `dfs_E_6` browser detection format and consistency
 - `dfs_E_7` SCAR bit expectations
+  - shuffled bit strings can be decoded with `DFS_E7_BIT_SHUFFLE_ENABLED=true`
   - bit 0 defaults to `1` for Playwright-launched webdriver sessions
   - bit 16 and bit 22 default to `0`, unless the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
   - bits 1, 25, 26, and 27 default to `0`
-- `dfs_E_1` non-incognito expectation
+- `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
+- Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`
+- Interaction SCAR bit expectations; set `IGNORE_INTERACTION_SCAR_BITS=21,31` to ignore specific behavior bits while still collecting evidence
 - `dfs_B*`, `dfs_D*`, `dfs_I*`, `dfs_M*`, and `dfs_N*` payload availability
 - Optional mouse movement and `dfs_F_2` comparison
 - `dfs_F_1` stability across reload

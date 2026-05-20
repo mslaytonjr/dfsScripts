@@ -5,7 +5,7 @@ const { chromium, firefox, webkit } = require('playwright');
 const ROOT_DIR = __dirname;
 const BROWSER_PATHS_FILE = path.join(ROOT_DIR, 'browser-paths.properties');
 const DEFAULT_ENV_FILE = path.join(ROOT_DIR, '.env');
-const REQUIRED_DFS_COOKIES = ['dfs_E_5', 'dfs_E_6', 'dfs_E_7', 'dfs_E_8', 'dfs_F_5', 'dfs_F_6', 'dfs_F_7'];
+const REQUIRED_DFS_COOKIES = ['dfs_E_4', 'dfs_E_5', 'dfs_E_6', 'dfs_E_7', 'dfs_E_8', 'dfs_F_5', 'dfs_F_6', 'dfs_F_7'];
 const FINGERPRINT_PREFIXES = ['dfs_B', 'dfs_D', 'dfs_I', 'dfs_M', 'dfs_N'];
 const DFS_KEY_PATTERN_BY_PREFIX = {
   dfs_B: /^dfs_B_\d+$/,
@@ -677,6 +677,76 @@ function getBitValue(bitString, bitNumber) {
   return text[index];
 }
 
+function mulberry32(seed) {
+  let value = seed >>> 0;
+  return () => {
+    value = (value + 0x6D2B79F5) >>> 0;
+    let next = value;
+    next = Math.imul(next ^ (next >>> 15), next | 1);
+    next ^= next + Math.imul(next ^ (next >>> 7), next | 61);
+    return ((next ^ (next >>> 14)) >>> 0);
+  };
+}
+
+function getDfsE7Shuffle(seedHex, bitCount = 32) {
+  const seedText = String(seedHex || '').slice(0, 8);
+  if (!/^[0-9a-f]{8}$/i.test(seedText)) return null;
+
+  const seed = parseInt(seedText, 16);
+  const random = mulberry32(seed);
+  const labels = Array.from({ length: bitCount }, (_, index) => `S${String(index + 1).padStart(3, '0')}`);
+
+  for (let index = labels.length - 1; index > 0; index -= 1) {
+    const nextIndex = random() % (index + 1);
+    [labels[index], labels[nextIndex]] = [labels[nextIndex], labels[index]];
+  }
+
+  const semanticToShuffledIndex = {};
+  const semanticToLabelIndex = {};
+  labels.forEach((label, shuffledIndex) => {
+    semanticToShuffledIndex[Number(label.slice(1)) - 1] = shuffledIndex;
+    semanticToLabelIndex[shuffledIndex] = Number(label.slice(1)) - 1;
+  });
+
+  return {
+    enabled: true,
+    seedHex: seedText,
+    seed,
+    mapping: readString('DFS_E7_BIT_SHUFFLE_MAPPING', 'semantic-index-to-label-index'),
+    shuffledLabels: labels,
+    semanticToShuffledIndex,
+    semanticToLabelIndex,
+  };
+}
+
+function getDfsE7BitValue(bitString, bitNumber, shuffle) {
+  if (!shuffle) return getBitValue(bitString, bitNumber);
+  const decoded = decodeDfsE7BitString(bitString, shuffle);
+  return getBitValue(decoded, bitNumber);
+}
+
+function decodeDfsE7BitString(bitString, shuffle) {
+  if (bitString === undefined || bitString === null || !shuffle || !Array.isArray(shuffle.shuffledLabels)) {
+    return bitString === undefined || bitString === null ? '' : String(bitString);
+  }
+
+  const text = String(bitString);
+  const decoded = Array.from({ length: text.length }, () => null);
+
+  shuffle.shuffledLabels.forEach((label, shuffledIndex) => {
+    const labelIndex = Number(label.slice(1)) - 1;
+    if (labelIndex < 0 || labelIndex >= decoded.length) return;
+
+    if (shuffle.mapping === 'find-label') {
+      decoded[labelIndex] = text[shuffledIndex];
+    } else {
+      decoded[shuffledIndex] = text[labelIndex];
+    }
+  });
+
+  return decoded.map((value) => value === null ? '' : value).join('');
+}
+
 function getFingerprintValue(fingerprint, key) {
   if (!fingerprint || typeof fingerprint !== 'object') return undefined;
   const stack = [fingerprint];
@@ -806,9 +876,10 @@ async function getNotABrandQuestionMarkSignal(page) {
   });
 }
 
-function isDfsJsUrl(value) {
+function isDfsOrLevoJsUrl(value) {
   try {
-    return new URL(value).pathname.toLowerCase().endsWith('dfs.js');
+    const pathname = new URL(value).pathname.toLowerCase();
+    return pathname.endsWith('dfs.js') || pathname.endsWith('levo.js');
   } catch {
     return false;
   }
@@ -848,44 +919,79 @@ async function loadScriptOverrideSource(context, source) {
 }
 
 async function installScriptOverride(context, outputDir) {
-  const match = readString('SCRIPT_OVERRIDE_MATCH');
-  const source = readString('SCRIPT_OVERRIDE_SOURCE');
-  if (!match && !source) return null;
-  if (!match || !source) {
-    throw new Error('SCRIPT_OVERRIDE_MATCH and SCRIPT_OVERRIDE_SOURCE must both be configured to override a script.');
+  const configs = [
+    {
+      name: 'script',
+      matchEnv: 'SCRIPT_OVERRIDE_MATCH',
+      sourceEnv: 'SCRIPT_OVERRIDE_SOURCE',
+      match: readString('SCRIPT_OVERRIDE_MATCH'),
+      source: readString('SCRIPT_OVERRIDE_SOURCE'),
+    },
+    {
+      name: 'levo',
+      matchEnv: 'LEVO_SCRIPT_OVERRIDE_MATCH',
+      sourceEnv: 'LEVO_SCRIPT_OVERRIDE_SOURCE',
+      match: readString('LEVO_SCRIPT_OVERRIDE_MATCH'),
+      source: readString('LEVO_SCRIPT_OVERRIDE_SOURCE'),
+    },
+  ];
+  const enabledConfigs = configs.filter((config) => config.match || config.source);
+  if (enabledConfigs.length === 0) return null;
+
+  for (const config of enabledConfigs) {
+    if (!config.match || !config.source) {
+      throw new Error(`${config.matchEnv} and ${config.sourceEnv} must both be configured to override a script.`);
+    }
   }
 
-  const matches = matcherFromConfig(match);
-  const replacement = await loadScriptOverrideSource(context, source);
+  const overrides = await Promise.all(enabledConfigs.map(async (config) => {
+    const replacement = await loadScriptOverrideSource(context, config.source);
+    return {
+      ...config,
+      matches: matcherFromConfig(config.match),
+      replacement,
+      found: false,
+      matchedRequests: [],
+    };
+  }));
   const details = {
     enabled: true,
-    match,
-    sourceType: replacement.sourceType,
-    source: replacement.source,
-    contentType: replacement.contentType,
-    found: false,
-    matchedRequests: [],
+    overrides: overrides.map((override) => ({
+      name: override.name,
+      match: override.match,
+      sourceType: override.replacement.sourceType,
+      source: override.replacement.source,
+      contentType: override.replacement.contentType,
+      found: false,
+      matchedRequests: [],
+    })),
   };
 
   await context.route('**/*', async (route) => {
     const request = route.request();
-    if (!matches(request.url())) {
+    const overrideIndex = overrides.findIndex((override) => override.matches(request.url()));
+    if (overrideIndex === -1) {
       await route.continue();
       return;
     }
 
-    details.matchedRequests.push({
+    const override = overrides[overrideIndex];
+    const detail = details.overrides[overrideIndex];
+    const matchedRequest = {
       url: request.url(),
       method: request.method(),
       resourceType: request.resourceType(),
       timestamp: new Date().toISOString(),
-    });
-    details.found = true;
+    };
+    override.matchedRequests.push(matchedRequest);
+    override.found = true;
+    detail.matchedRequests.push(matchedRequest);
+    detail.found = true;
 
     await route.fulfill({
       status: 200,
-      contentType: replacement.contentType,
-      body: replacement.body,
+      contentType: override.replacement.contentType,
+      body: override.replacement.body,
     });
   });
 
@@ -1097,6 +1203,41 @@ async function maybeMoveMouse(page) {
   }
 }
 
+async function getInteractionTargetPoint(page) {
+  return page.evaluate(() => {
+    const id = 'dfs-interaction-target';
+    let target = document.getElementById(id);
+    if (!target) {
+      target = document.createElement('button');
+      target.id = id;
+      target.type = 'button';
+      target.tabIndex = -1;
+      target.setAttribute('aria-hidden', 'true');
+      target.style.cssText = [
+        'position:fixed',
+        'left:24px',
+        'top:24px',
+        'width:96px',
+        'height:96px',
+        'z-index:2147483647',
+        'opacity:0.01',
+        'border:0',
+        'padding:0',
+        'margin:0',
+        'background:#000',
+        'pointer-events:auto',
+      ].join(';');
+      target.addEventListener('contextmenu', (event) => event.preventDefault());
+      document.documentElement.appendChild(target);
+    }
+    const rect = target.getBoundingClientRect();
+    return {
+      x: Math.floor(rect.left + rect.width / 2),
+      y: Math.floor(rect.top + rect.height / 2),
+    };
+  });
+}
+
 async function maybeTeleportMouse(page) {
   const viewport = page.viewportSize() || { width: 1280, height: 720 };
   const points = [
@@ -1134,7 +1275,11 @@ function getBehaviorBitExpectations(scenarioName) {
     focus_input_speed: { bit21: '1', bit30: '1' },
     scroll_click_pattern: { bit31: '1' },
   };
-  return expectations[scenarioName] || {};
+  const ignoredBits = parseSet(readString('IGNORE_INTERACTION_SCAR_BITS'));
+  return Object.fromEntries(
+    Object.entries(expectations[scenarioName] || {})
+      .filter(([key]) => !ignoredBits.has(key.toLowerCase()) && !ignoredBits.has(key.toLowerCase().replace('bit', '')))
+  );
 }
 
 function getInputInteractionConfig() {
@@ -1232,21 +1377,27 @@ async function readBehaviorState(page) {
   const cookies = parseCookieArray(await getDfsCookies(page));
   const fingerprint = await getFingerprint(page);
   const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+  const f5 = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+  const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(f5, e7.length || 32) : null;
+  const decodedE7 = decodeDfsE7BitString(e7, e7Shuffle);
   return {
     cookies,
     fingerprint,
     dfs_E_5: cookies.dfs_E_5 || getFingerprintValue(fingerprint, 'dfs_E_5'),
     dfs_E_7: e7,
+    dfs_E_7_decoded: decodedE7,
+    dfs_F_5: f5,
+    dfs_E_7_shuffle: e7Shuffle,
     dfs_F_2: cookies.dfs_F_2 || getFingerprintValue(fingerprint, 'dfs_F_2'),
     bits: {
-      bit21: getBitValue(e7, 21),
-      bit25: getBitValue(e7, 25),
-      bit26: getBitValue(e7, 26),
-      bit27: getBitValue(e7, 27),
-      bit28: getBitValue(e7, 28),
-      bit29: getBitValue(e7, 29),
-      bit30: getBitValue(e7, 30),
-      bit31: getBitValue(e7, 31),
+      bit21: getDfsE7BitValue(e7, 21, e7Shuffle),
+      bit25: getDfsE7BitValue(e7, 25, e7Shuffle),
+      bit26: getDfsE7BitValue(e7, 26, e7Shuffle),
+      bit27: getDfsE7BitValue(e7, 27, e7Shuffle),
+      bit28: getDfsE7BitValue(e7, 28, e7Shuffle),
+      bit29: getDfsE7BitValue(e7, 29, e7Shuffle),
+      bit30: getDfsE7BitValue(e7, 30, e7Shuffle),
+      bit31: getDfsE7BitValue(e7, 31, e7Shuffle),
     },
   };
 }
@@ -1320,9 +1471,10 @@ async function performInteractionScenario(page, scenarioName) {
       break;
     case 'payload_coverage':
       await maybeMoveMouse(page);
-      await page.mouse.click(120, 120);
-      await page.mouse.dblclick(140, 140);
-      await page.mouse.click(160, 160, { button: 'right' });
+      const point = await getInteractionTargetPoint(page);
+      await page.mouse.click(point.x, point.y);
+      await page.mouse.dblclick(point.x + 8, point.y + 8);
+      await page.mouse.click(point.x + 16, point.y + 16, { button: 'right' });
       await page.mouse.wheel(0, 250);
       await page.evaluate(() => window.scrollBy(0, 250));
       if (config.usernameSelector) {
@@ -1387,12 +1539,18 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       before: {
         dfs_E_5: before.dfs_E_5,
         dfs_E_7: before.dfs_E_7,
+        dfs_E_7_decoded: before.dfs_E_7_decoded,
+        dfs_F_5: before.dfs_F_5,
+        dfs_E_7_shuffle: before.dfs_E_7_shuffle,
         dfs_F_2: before.dfs_F_2,
         bits: before.bits,
       },
       after: {
         dfs_E_5: after.dfs_E_5,
         dfs_E_7: after.dfs_E_7,
+        dfs_E_7_decoded: after.dfs_E_7_decoded,
+        dfs_F_5: after.dfs_F_5,
+        dfs_E_7_shuffle: after.dfs_E_7_shuffle,
         dfs_F_2: after.dfs_F_2,
         bits: after.bits,
       },
@@ -2096,7 +2254,7 @@ async function runTarget(target, config) {
     });
     page.on('request', (request) => {
       const url = request.url();
-      if (!isDfsJsUrl(url)) return;
+      if (!isDfsOrLevoJsUrl(url)) return;
 
       dfsJsFiles.push({
         url,
@@ -2200,12 +2358,18 @@ async function runTarget(target, config) {
     );
 
     const e7 = String(initialCookieMap.dfs_E_7 || getFingerprintValue(initialFingerprint, 'dfs_E_7') || '');
+    const e7Seed = initialCookieMap.dfs_F_5 || getFingerprintValue(initialFingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    const decodedE7 = decodeDfsE7BitString(e7, e7Shuffle);
     const expectedWebdriverBit0 = readString('EXPECTED_DFS_E7_BIT0', '1');
     const expectedMissingClientHints = expectsMissingClientHints(target.browser);
     const notABrandQuestionMarkSignal = await runStep('read Not A Brand client-hints signal', () => getNotABrandQuestionMarkSignal(page));
     const scarBits = {
       dfs_E_7: e7,
-      indexing: 'zero-based; bit 0 is the first character',
+      dfs_E_7_decoded: decodedE7,
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      indexing: e7Shuffle ? 'semantic bit numbers decoded from shuffled dfs_E_7; bit 0 maps to S001' : 'zero-based; bit 0 is the first character',
       expectedMissingClientHints,
       notABrandQuestionMarkSignal,
       expectations: {
@@ -2217,13 +2381,13 @@ async function runTarget(target, config) {
         bit26: '0',
         bit27: '0',
       },
-      bit0: getBitValue(e7, 0),
-      bit1: getBitValue(e7, 1),
-      bit16: getBitValue(e7, 16),
-      bit22: getBitValue(e7, 22),
-      bit25: getBitValue(e7, 25),
-      bit26: getBitValue(e7, 26),
-      bit27: getBitValue(e7, 27),
+      bit0: getDfsE7BitValue(e7, 0, e7Shuffle),
+      bit1: getDfsE7BitValue(e7, 1, e7Shuffle),
+      bit16: getDfsE7BitValue(e7, 16, e7Shuffle),
+      bit22: getDfsE7BitValue(e7, 22, e7Shuffle),
+      bit25: getDfsE7BitValue(e7, 25, e7Shuffle),
+      bit26: getDfsE7BitValue(e7, 26, e7Shuffle),
+      bit27: getDfsE7BitValue(e7, 27, e7Shuffle),
     };
     const bit16Expected = scarBits.expectations.bit16;
     let scarBit16FailureSignalsFile = null;
@@ -2238,16 +2402,27 @@ async function runTarget(target, config) {
       .map(([key, expectedValue]) => `${key} expected ${expectedValue}, got ${scarBits[key]}`);
     addResult(results, 'AI Score / SCAR Testing', scarFailures.length === 0 ? 'PASS' : 'FAIL', scarBits, scarEvidenceFiles, scarFailures);
 
-    const privateMode = { dfs_E_1: getFingerprintValue(initialFingerprint, 'dfs_E_1') };
-    const privateModeFile = saveJson(path.join(outputDir, 'private-mode.json'), privateMode);
-    addResult(
-      results,
-      'Private / Incognito Mode Detection',
-      String(privateMode.dfs_E_1) === '0' ? 'PASS' : 'FAIL',
-      privateMode,
-      [privateModeFile],
-      String(privateMode.dfs_E_1) === '0' ? [] : [`dfs_E_1 expected 0, got ${privateMode.dfs_E_1}`]
-    );
+    if (readBoolean('PERFORM_PRIVATE_MODE_DETECTION_TEST', true)) {
+      const privateMode = { dfs_E_1: getFingerprintValue(initialFingerprint, 'dfs_E_1') };
+      const privateModeFile = saveJson(path.join(outputDir, 'private-mode.json'), privateMode);
+      addResult(
+        results,
+        'Private / Incognito Mode Detection',
+        String(privateMode.dfs_E_1) === '0' ? 'PASS' : 'FAIL',
+        privateMode,
+        [privateModeFile],
+        String(privateMode.dfs_E_1) === '0' ? [] : [`dfs_E_1 expected 0, got ${privateMode.dfs_E_1}`]
+      );
+    } else {
+      addResult(
+        results,
+        'Private / Incognito Mode Detection',
+        'SKIP',
+        { reason: 'PERFORM_PRIVATE_MODE_DETECTION_TEST=false; normal-session private/incognito check skipped by configuration.' },
+        [],
+        ['Private/incognito mode detection skipped by configuration.']
+      );
+    }
 
     await runPrivateModeBrowserTest(target, config, outputDir, results);
 
@@ -2357,13 +2532,24 @@ async function runTarget(target, config) {
   } finally {
     if (scriptOverride) {
       saveJson(path.join(outputDir, 'script-override.json'), scriptOverride);
-      metadata.scriptOverride = {
-        match: scriptOverride.match,
-        sourceType: scriptOverride.sourceType,
-        source: scriptOverride.source,
-        found: scriptOverride.found,
-        matchedRequests: scriptOverride.matchedRequests.length,
-      };
+      metadata.scriptOverride = scriptOverride.overrides
+        ? {
+          overrides: scriptOverride.overrides.map((override) => ({
+            name: override.name,
+            match: override.match,
+            sourceType: override.sourceType,
+            source: override.source,
+            found: override.found,
+            matchedRequests: override.matchedRequests.length,
+          })),
+        }
+        : {
+          match: scriptOverride.match,
+          sourceType: scriptOverride.sourceType,
+          source: scriptOverride.source,
+          found: scriptOverride.found,
+          matchedRequests: scriptOverride.matchedRequests.length,
+        };
     }
 
     const consoleFile = saveJson(path.join(outputDir, 'console-log.json'), consoleMessages);
