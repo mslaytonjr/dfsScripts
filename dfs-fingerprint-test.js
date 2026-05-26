@@ -54,7 +54,7 @@ function loadEnvFile(filePath) {
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
-    if (!(key in process.env)) process.env[key] = value;
+    if (process.env[key] === undefined || process.env[key] === '') process.env[key] = value;
   }
 }
 
@@ -1712,6 +1712,22 @@ function getLoginFrame(page) {
   return null;
 }
 
+async function clickLocatorWithoutNavigationWait(page, locator) {
+  const timeout = Number(process.env.FIELD_TIMEOUT_MS || 45000);
+  await locator.waitFor({ state: 'visible', timeout });
+  await locator.scrollIntoViewIfNeeded({ timeout });
+
+  const box = await locator.boundingBox({ timeout });
+  if (!box) {
+    throw new Error('Unable to resolve submit button coordinates.');
+  }
+
+  await page.mouse.click(
+    Math.floor(box.x + box.width / 2),
+    Math.floor(box.y + box.height / 2)
+  );
+}
+
 async function fillAndSubmit(page) {
   const frameSelector = process.env.LOGIN_FRAME_SELECTOR;
   const usernameSelector = process.env.USERNAME_SELECTOR;
@@ -1744,9 +1760,9 @@ async function fillAndSubmit(page) {
   }
 
   if (submitButton) {
-    await submitButton.click();
+    await clickLocatorWithoutNavigationWait(page, submitButton);
   } else {
-    await passwordField.press('Enter');
+    await page.keyboard.press('Enter');
   }
 }
 
