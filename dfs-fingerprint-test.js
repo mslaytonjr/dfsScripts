@@ -211,7 +211,7 @@ async function runWithTimeout(label, timeoutMs, action) {
   }
 }
 
-async function getFingerprint(page) {
+async function readFingerprintNow(page) {
   return page.evaluate(() => {
     const data = window.FingerprintData;
     if (!data) {
@@ -252,12 +252,27 @@ async function waitForFingerprintData(page, timeout = Number(process.env.FINGERP
   }
 }
 
+async function getFingerprint(page, options = {}) {
+  const wait = options.wait !== false;
+  const waitResult = wait
+    ? await waitForFingerprintData(page, options.timeout)
+    : { available: true, timeoutMs: 0 };
+  const fingerprint = await readFingerprintNow(page);
+  if (fingerprint && typeof fingerprint === 'object' && fingerprint.__error) {
+    return {
+      ...fingerprint,
+      __wait: waitResult,
+    };
+  }
+  return fingerprint;
+}
+
 async function waitForDfsE7Value(page, context, timeout = Number(process.env.DFS_E7_WAIT_TIMEOUT_MS || 15000)) {
   const startedAt = Date.now();
   let lastState = null;
 
   while (Date.now() - startedAt <= timeout) {
-    const fingerprint = await getFingerprint(page).catch((error) => ({ __error: error.message }));
+    const fingerprint = await readFingerprintNow(page).catch((error) => ({ __error: error.message }));
     const documentCookieList = await getDfsCookies(page).catch((error) => ({ __error: error.message }));
     const documentDfsCookies = Array.isArray(documentCookieList) ? parseCookieArray(documentCookieList) : {};
     const contextDfsCookies = await getDfsContextCookies(context).catch((error) => ({ __error: error.message }));
