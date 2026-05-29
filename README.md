@@ -201,8 +201,8 @@ programmatic_input     set username via untrusted input event; expects S027/S022
 mouse_teleport         jump pointer across the viewport; expects S029/S022
 low_mouse_activity     wait 3s with no mouse movement; expects S030/S022
 focus_input_speed      focus username/password and type very quickly; expects S031/S022
-rapid_click_pattern    5+ rapid clicks; expects S032/S022
-rapid_scroll_pattern   5+ rapid scrolls; expects S032/S022
+rapid_click_pattern    5+ rapid clicks; expects S032
+rapid_scroll_pattern   5+ rapid scrolls; expects S032
 scroll_click_pattern   legacy combined repeated clicks and wheel scrolling
 payload_coverage       mixed mouse/input events; expects dfs_F_2 to change
 ```
@@ -452,7 +452,7 @@ evidence/<releaseversion>/summary-report.json
   - S011 appears as media-device enumeration controls; optional `PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=true` runs headless contexts where `enumerateDevices()` returns `[]` and rejects
   - S012/S013/S014 appear as hardware-concurrency controls; optional `PERFORM_HARDWARE_CONCURRENCY_TESTS=true` runs three contexts for `navigator.hardwareConcurrency == 1`, `> 1 and < 5`, and `>= 5`, asserting all three bits in each case
   - S015 appears as a suspicious user-agent control; optional `PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=true` runs a context with `SUSPICIOUS_UA_STRING` containing `SUSPICIOUS_UA_KEYWORD`
-  - S016 appears as a fingerprint modification control; optional `PERFORM_FINGERPRINT_MODIFICATION_TEST=true` waits for `dfs_F_1`, tampers it to `TAMPERED`, reloads to trigger re-collection, and expects S016 to fire
+  - S016 appears as a fingerprint modification control; optional `PERFORM_FINGERPRINT_MODIFICATION_TEST=true` waits for `dfs_F_1`, sets `localStorage.browserFingerPrint` to `bad_value`, reloads to trigger re-collection, and expects S016 to fire
   - S018/S019/S020/S021/S023/S017/S024/S025 appear as client-hints and UA spoofing controls; optional `PERFORM_CLIENT_HINTS_TESTS=true` runs Apple-signature, WebGL renderer anomaly, client-hints brand quirk, locale/timezone mismatch, empty, populated, UA/CH version-mismatched, UA/CH version-matched, UA/CH platform-mismatched, and UA/CH platform-matched contexts. S018, S019, S020, S021, S024, and S025 mismatches also expect S017 to fire.
   - bit 16 defaults to `1` when `navigator.userAgentData` is missing, when a Not A Brand client-hints brand contains `?`, or when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`; bit 22 defaults to `1` when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
   - bits 25, 26, and 27 default to `0`

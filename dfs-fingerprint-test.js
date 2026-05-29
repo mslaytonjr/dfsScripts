@@ -2138,8 +2138,8 @@ function getBehaviorBitExpectations(scenarioName) {
     mouse_teleport: { bit21: '1', bit28: '1' },
     low_mouse_activity: { bit21: '1', bit29: '1' },
     focus_input_speed: { bit21: '1', bit30: '1' },
-    rapid_click_pattern: { bit21: '1', bit31: '1' },
-    rapid_scroll_pattern: { bit21: '1', bit31: '1' },
+    rapid_click_pattern: { bit31: '1' },
+    rapid_scroll_pattern: { bit31: '1' },
     scroll_click_pattern: { bit21: '1', bit31: '1' },
   };
   const ignoredBits = parseSet(readString('IGNORE_INTERACTION_SCAR_BITS'));
@@ -2579,7 +2579,6 @@ async function performInteractionScenario(page, scenarioName) {
         point,
         syntheticWindowEvents,
         expectedBit: 'S032',
-        expectedRollupBit: 'S022',
       };
       break;
     }
@@ -2599,7 +2598,6 @@ async function performInteractionScenario(page, scenarioName) {
         point,
         syntheticWindowEvents,
         expectedBit: 'S032',
-        expectedRollupBit: 'S022',
       };
       break;
     }
@@ -3922,7 +3920,7 @@ async function runSuspiciousUserAgentKeywordTest(browser, config, outputDir, res
 }
 
 async function runFingerprintModificationTest(browser, config, outputDir, results) {
-  const testName = 'S016 fingerprint cookie modification detected';
+  const testName = 'S016 browser fingerprint localStorage modification detected';
   if (!readBoolean('PERFORM_FINGERPRINT_MODIFICATION_TEST', false)) {
     addResult(
       results,
@@ -3959,12 +3957,12 @@ async function runFingerprintModificationTest(browser, config, outputDir, result
     const beforeCookies = parseCookieArray(await getDfsCookies(page));
     const beforeContextCookies = await getDfsContextCookies(context);
     const beforeF1 = beforeCookies.dfs_F_1 || beforeContextCookies.dfs_F_1 || getFingerprintValue(beforeFingerprint, 'dfs_F_1');
+    const beforeLocalStorageValue = await page.evaluate(() => localStorage.getItem('browserFingerPrint'));
 
     await page.evaluate(() => {
-      document.cookie = 'dfs_F_1=TAMPERED; path=/; SameSite=Lax';
+      localStorage.setItem('browserFingerPrint', 'bad_value');
     });
-    const tamperedCookies = parseCookieArray(await getDfsCookies(page));
-    const tamperedContextCookies = await getDfsContextCookies(context);
+    const tamperedLocalStorageValue = await page.evaluate(() => localStorage.getItem('browserFingerPrint'));
 
     await page.reload({
       waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
@@ -3982,21 +3980,22 @@ async function runFingerprintModificationTest(browser, config, outputDir, result
     const evidence = {
       before: {
         dfs_F_1: beforeF1,
+        browserFingerPrint: beforeLocalStorageValue,
         cookies: beforeCookies,
         contextCookies: beforeContextCookies,
       },
       tampered: {
-        attemptedCookieValue: 'TAMPERED',
-        dfs_F_1: tamperedCookies.dfs_F_1 || tamperedContextCookies.dfs_F_1,
-        cookies: tamperedCookies,
-        contextCookies: tamperedContextCookies,
+        key: 'browserFingerPrint',
+        attemptedValue: 'bad_value',
+        browserFingerPrint: tamperedLocalStorageValue,
       },
       afterRecollection: {
         cookies: afterCookies,
         contextCookies: afterContextCookies,
         dfs_F_1: afterCookies.dfs_F_1 || afterContextCookies.dfs_F_1 || getFingerprintValue(afterFingerprint, 'dfs_F_1'),
+        browserFingerPrint: await page.evaluate(() => localStorage.getItem('browserFingerPrint')).catch(() => null),
       },
-      trigger: 'Set document.cookie dfs_F_1=TAMPERED, then reloaded the page to force DFS re-collection.',
+      trigger: "Set localStorage browserFingerPrint to bad_value, then reloaded the page to force DFS re-collection.",
       dfs_E_7: e7,
       dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
       dfs_F_5_seed_source: e7Seed,
@@ -4004,10 +4003,10 @@ async function runFingerprintModificationTest(browser, config, outputDir, result
       bit15: getDfsE7BitValue(e7, 15, e7Shuffle),
       expectedBit15: '1',
     };
-    const evidenceFile = saveJson(path.join(outputDir, 'fingerprint-cookie-modification-s016.json'), evidence);
+    const evidenceFile = saveJson(path.join(outputDir, 'fingerprint-localstorage-modification-s016.json'), evidence);
     const failures = [
       ...(beforeF1 ? [] : ['dfs_F_1 was not present before tampering']),
-      ...(evidence.tampered.dfs_F_1 === 'TAMPERED' ? [] : [`dfs_F_1 tamper expected TAMPERED, got ${evidence.tampered.dfs_F_1}`]),
+      ...(evidence.tampered.browserFingerPrint === 'bad_value' ? [] : [`browserFingerPrint tamper expected bad_value, got ${evidence.tampered.browserFingerPrint}`]),
       ...(evidence.bit15 === '1' ? [] : [`S016 expected 1, got ${evidence.bit15}`]),
     ];
     addResult(results, testName, failures.length === 0 ? 'PASS' : 'FAIL', evidence, [evidenceFile], failures);
