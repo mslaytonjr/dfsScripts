@@ -126,6 +126,7 @@ PUBLIC.PASSWORD_SELECTOR=#password-text-input-field
 PUBLIC.SUBMIT_SELECTOR=#signin-button
 
 SECURE.TARGET_URL=https://secure.chase.com
+SECURE.HEADLESS=false
 SECURE.LOGIN_FRAME_SELECTOR=iframe[name="logonbox"]
 SECURE.LOGIN_FRAME_NAME=logonbox
 SECURE.LOGIN_BEFORE_MOUSE=true
@@ -146,8 +147,23 @@ HEADLESS=true
 PERFORM_MOUSE_MOVEMENT=true
 DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
+PERFORM_INTERACTION_SCENARIO_TESTS=true
+INTERACTION_TEST_SCENARIOS=human_typing,payload_coverage
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
+FIREFOX_FORCE_WEBDRIVER_TRUE=true
+PERFORM_WEBDRIVER_SUPPRESSION_TEST=false
+PERFORM_PLUGIN_SUPPRESSION_TEST=false
+PERFORM_INDEXEDDB_SUPPRESSION_TEST=false
+PERFORM_GPU_RENDERER_TESTS=false
+PERFORM_DEVICE_PIXEL_RATIO_TESTS=false
+PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=false
+PERFORM_HARDWARE_CONCURRENCY_TESTS=false
+PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=false
+SUSPICIOUS_UA_KEYWORD=Googlebot
+SUSPICIOUS_UA_STRING=Mozilla/5.0 (compatible; Googlebot/2.1; +https://www.google.com/bot.html)
+PERFORM_FINGERPRINT_MODIFICATION_TEST=false
+PERFORM_CLIENT_HINTS_TESTS=false
 DFS_E7_BIT_SHUFFLE_ENABLED=false
 DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index
 DFS_E7_CLIENT_HINTS_MISSING_BROWSERS=opera
@@ -167,6 +183,29 @@ Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for browser keys that are expected no
 Set `DFS_E7_BIT_SHUFFLE_ENABLED=true` when `dfs_E_7` is emitted in shuffled order. The runner derives the shuffle seed from `parseInt(dfs_F_5.slice(0, 8), 16)`, uses Mulberry32 returning a raw uint32, applies descending Fisher-Yates with `rand() % (i + 1)` to `S001` through `S032`, and then evaluates semantic bit numbers against the shuffled positions. `DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index` means semantic bit N reads from the position named by shuffled label N; use `find-label` if semantic bit N is stored where `S00N` landed.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
+
+For Chase runs that land on the system-requirements page, the runner marks the target availability check as skipped instead of failing downstream DFS tests. For Secure, `SECURE_SYSTEM_REQUIREMENTS_SIGNIN_RECOVERY=true` also clicks the visible Sign in link and waits again before deciding whether to skip. `LOGIN_FRAME_WAIT_TIMEOUT_MS` controls how long the runner waits for `LOGIN_FRAME_NAME` or `LOGIN_FRAME_URL_MATCHER` before falling back to the top page.
+
+`INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
+
+Transient interaction and spoofing-control failures are retried with `TEST_RETRY_ATTEMPTS=3` and `TEST_RETRY_DELAY_MS=3000`. Retries are limited to page-readiness failures such as missing selectors, null/undefined reads, detached frames, destroyed execution contexts, or timeouts; bit assertion mismatches still fail immediately.
+
+Valid interaction scenarios:
+
+```text
+human_typing           normal mouse movement plus slower username/password typing
+bot_fast_typing        fast typing that should trigger bot-like input bits
+robotic_typing_cadence type user123 with uniform 50ms delay; expects S026/S022
+paste                  paste into the username field; expects S028/S022
+programmatic_input     set username via untrusted input event; expects S027/S022
+mouse_teleport         jump pointer across the viewport; expects S029/S022
+low_mouse_activity     wait 3s with no mouse movement; expects S030/S022
+focus_input_speed      focus username/password and type very quickly; expects S031/S022
+rapid_click_pattern    5+ rapid clicks; expects S032/S022
+rapid_scroll_pattern   5+ rapid scrolls; expects S032/S022
+scroll_click_pattern   legacy combined repeated clicks and wheel scrolling
+payload_coverage       mixed mouse/input events; expects dfs_F_2 to change
+```
 
 To scan the loaded page and list candidate username, password, and submit selectors without running the full validation:
 
@@ -192,6 +231,8 @@ LOGIN_REQUEST_MATCHER=/login|auth|signin/i
 COOKIE_SETTLE_WAIT_MS=0
 INITIAL_COOKIE_WAIT_MS=
 POST_SUBMIT_COOKIE_WAIT_MS=
+FINGERPRINT_DATA_WAIT_TIMEOUT_MS=15000
+DFS_E7_WAIT_TIMEOUT_MS=15000
 TYPE_DELAY_MS=50
 BEFORE_SUBMIT_WAIT_MS=750
 ```
@@ -352,12 +393,19 @@ Evidence is written to:
 evidence/<releaseversion>/<browser>/<browserversion>/
 ```
 
-The aggregate files below are written when the run starts, refreshed after each browser finishes, and finalized at completion. You can refresh `cover-report.html` while the test is running to watch progress.
+If `evidence/<releaseversion>` already exists, the next run is written to a numbered folder:
+
+```text
+evidence/<releaseversion>/test-N/<browser>/<browserversion>/
+```
+
+The aggregate files below are written when the run starts, refreshed after each browser finishes, and finalized at completion. You can refresh `cover-report.html` while the test is running to watch progress. For numbered `test-N` runs, the root `evidence/<releaseversion>` files are refreshed as latest-run pointers so old null failures are not shown from stale reports.
 
 ```text
 evidence/<releaseversion>/summary-report.json
 evidence/<releaseversion>/cover-report.html
 evidence/<releaseversion>/portable-evidence.txt
+evidence/<releaseversion>/latest-run.json
 ```
 
 `portable-evidence.txt` is a compact single-file text report with browser/version, fingerprint values, DFS cookies, and each test's pass/fail status.
@@ -393,9 +441,21 @@ evidence/<releaseversion>/summary-report.json
 - `dfs_E_6` browser detection format and consistency
 - `dfs_E_7` SCAR bit expectations
   - shuffled bit strings can be decoded with `DFS_E7_BIT_SHUFFLE_ENABLED=true`
-  - bit 0 defaults to `1` for Playwright-launched webdriver sessions
+  - bit 0 defaults to `1` for Playwright-launched webdriver sessions where `navigator.webdriver === true`
+  - Firefox can force `navigator.webdriver === true` for the normal positive bit0 run with `FIREFOX_FORCE_WEBDRIVER_TRUE=true`
+  - optional `PERFORM_WEBDRIVER_SUPPRESSION_TEST=true` runs a negative control with `navigator.webdriver` suppressed and expects bit 0 to become `0`
+  - S001 also appears as separate report-grid rows: `S001 navigator.webdriver == true` and `S001 navigator.webdriver suppressed`
+  - S002/S003 appear as separate rows for `navigator.plugins.length == 0` and `navigator.plugins.length > 0`; optional `PERFORM_PLUGIN_SUPPRESSION_TEST=true` runs a zero-plugin negative-control context
+  - S004 appears as `S004 window.indexedDB unavailable`; optional `PERFORM_INDEXEDDB_SUPPRESSION_TEST=true` runs a context with `window.indexedDB` overridden to `undefined`
+  - S005/S006/S007 appear as GPU/WebGL controls; optional `PERFORM_GPU_RENDERER_TESTS=true` uses Chromium with mocked WebGL values. S005 uses `--headless=new --disable-gpu`; S006 uses `--headless=new` with a software renderer string; S007 mocks `getSupportedExtensions()` to fewer than 15 entries.
+  - S008/S009/S010 appear as DPR controls; optional `PERFORM_DEVICE_PIXEL_RATIO_TESTS=true` runs three contexts for `devicePixelRatio < 1`, `== 1`, and `>= 2`, asserting all three bits in each case
+  - S011 appears as media-device enumeration controls; optional `PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=true` runs headless contexts where `enumerateDevices()` returns `[]` and rejects
+  - S012/S013/S014 appear as hardware-concurrency controls; optional `PERFORM_HARDWARE_CONCURRENCY_TESTS=true` runs three contexts for `navigator.hardwareConcurrency == 1`, `> 1 and < 5`, and `>= 5`, asserting all three bits in each case
+  - S015 appears as a suspicious user-agent control; optional `PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=true` runs a context with `SUSPICIOUS_UA_STRING` containing `SUSPICIOUS_UA_KEYWORD`
+  - S016 appears as a fingerprint modification control; optional `PERFORM_FINGERPRINT_MODIFICATION_TEST=true` waits for `dfs_F_1`, tampers it to `TAMPERED`, reloads to trigger re-collection, and expects S016 to fire
+  - S018/S019/S020/S021/S023/S017/S024/S025 appear as client-hints and UA spoofing controls; optional `PERFORM_CLIENT_HINTS_TESTS=true` runs Apple-signature, WebGL renderer anomaly, client-hints brand quirk, locale/timezone mismatch, empty, populated, UA/CH version-mismatched, UA/CH version-matched, UA/CH platform-mismatched, and UA/CH platform-matched contexts. S018, S019, S020, S021, S024, and S025 mismatches also expect S017 to fire.
   - bit 16 and bit 22 default to `0`, unless the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
-  - bits 1, 25, 26, and 27 default to `0`
+  - bits 25, 26, and 27 default to `0`
 - `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
 - Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`
 - Interaction SCAR bit expectations; set `IGNORE_INTERACTION_SCAR_BITS=21,31` to ignore specific behavior bits while still collecting evidence

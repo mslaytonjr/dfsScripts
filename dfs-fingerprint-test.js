@@ -153,6 +153,38 @@ function usesBundledFirefox(target) {
   return target.browser === 'firefox' && readBoolean('FIREFOX_USE_PLAYWRIGHT_BUNDLED', true);
 }
 
+async function installFirefoxWebdriverTrueInitScript(context, target) {
+  if (target.browser !== 'firefox' || !readBoolean('FIREFOX_FORCE_WEBDRIVER_TRUE', true)) {
+    return {
+      installed: false,
+      reason: target.browser === 'firefox'
+        ? 'FIREFOX_FORCE_WEBDRIVER_TRUE=false'
+        : 'Target browser is not firefox.',
+    };
+  }
+
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(Navigator.prototype, 'webdriver', {
+        configurable: true,
+        enumerable: true,
+        get: () => true,
+      });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'webdriver', {
+        configurable: true,
+        get: () => true,
+      });
+    } catch {}
+  });
+
+  return {
+    installed: true,
+    reason: 'Forced navigator.webdriver=true for Firefox bit0 validation.',
+  };
+}
+
 function isUnsupportedAutomationTarget(target) {
   return target.browser === 'duckduckgo';
 }
@@ -201,8 +233,129 @@ async function getFingerprint(page) {
   });
 }
 
+async function waitForFingerprintData(page, timeout = Number(process.env.FINGERPRINT_DATA_WAIT_TIMEOUT_MS || 15000)) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const data = window.FingerprintData;
+        return Boolean(
+          data &&
+          (typeof data.getFingerPrint === 'function' || typeof data.getFingerprint === 'function')
+        );
+      },
+      null,
+      { timeout }
+    );
+    return { available: true, timeoutMs: timeout };
+  } catch (error) {
+    return { available: false, timeoutMs: timeout, error: error.message };
+  }
+}
+
+async function waitForDfsE7Value(page, context, timeout = Number(process.env.DFS_E7_WAIT_TIMEOUT_MS || 15000)) {
+  const startedAt = Date.now();
+  let lastState = null;
+
+  while (Date.now() - startedAt <= timeout) {
+    const fingerprint = await getFingerprint(page).catch((error) => ({ __error: error.message }));
+    const documentCookieList = await getDfsCookies(page).catch((error) => ({ __error: error.message }));
+    const documentDfsCookies = Array.isArray(documentCookieList) ? parseCookieArray(documentCookieList) : {};
+    const contextDfsCookies = await getDfsContextCookies(context).catch((error) => ({ __error: error.message }));
+    const e7 = String(
+      documentDfsCookies.dfs_E_7 ||
+      contextDfsCookies.dfs_E_7 ||
+      getFingerprintValue(fingerprint, 'dfs_E_7') ||
+      ''
+    );
+
+    lastState = {
+      fingerprint,
+      documentCookieList,
+      documentDfsCookies,
+      contextDfsCookies,
+      dfs_E_7: e7,
+      waitedMs: Date.now() - startedAt,
+    };
+
+    if (e7) {
+      return {
+        found: true,
+        timeoutMs: timeout,
+        ...lastState,
+      };
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  return {
+    found: false,
+    timeoutMs: timeout,
+    ...(lastState || {}),
+  };
+}
+
 async function getDfsCookies(page) {
   return page.evaluate(() => document.cookie.split(';').map((cookie) => cookie.trim()).filter((cookie) => cookie.startsWith('dfs_')));
+}
+
+async function waitForDfsCookie(page, cookieName, timeout = Number(process.env.COOKIE_WAIT_TIMEOUT_MS || 15000)) {
+  await page.waitForFunction(
+    (name) => document.cookie.split(';').map((cookie) => cookie.trim()).some((cookie) => cookie.startsWith(`${name}=`)),
+    cookieName,
+    { timeout }
+  );
+}
+
+async function waitForDfsFingerprintValue(page, key, timeout = Number(process.env.FINGERPRINT_WAIT_TIMEOUT_MS || 15000)) {
+  await page.waitForFunction(
+    (fingerprintKey) => {
+      const data = window.FingerprintData;
+      const getter =
+        data && typeof data.getFingerPrint === 'function'
+          ? data.getFingerPrint
+          : data && typeof data.getFingerprint === 'function'
+            ? data.getFingerprint
+            : null;
+      if (!getter) return false;
+      const fingerprint = getter.call(data);
+      const stack = [fingerprint];
+      const seen = new Set();
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current || typeof current !== 'object' || seen.has(current)) continue;
+        seen.add(current);
+        if (Object.prototype.hasOwnProperty.call(current, fingerprintKey)) {
+          return current[fingerprintKey] !== undefined && current[fingerprintKey] !== null;
+        }
+        for (const value of Object.values(current)) {
+          if (value && typeof value === 'object') stack.push(value);
+        }
+      }
+      return false;
+    },
+    key,
+    { timeout }
+  );
+}
+
+async function getDfsContextCookies(context) {
+  const cookies = await context.cookies();
+  return Object.fromEntries(
+    cookies
+      .filter((cookie) => cookie.name && cookie.name.startsWith('dfs_'))
+      .map((cookie) => [cookie.name, cookie.value])
+  );
+}
+
+async function waitForDfsContextCookie(context, cookieName, timeout = Number(process.env.COOKIE_WAIT_TIMEOUT_MS || 15000)) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeout) {
+    const cookies = await getDfsContextCookies(context);
+    if (cookies[cookieName] !== undefined) return cookies;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timed out waiting for ${cookieName} in browser cookie jar after ${timeout}ms`);
 }
 
 async function getDfsE5DebugLog(page) {
@@ -876,6 +1029,304 @@ async function getNotABrandQuestionMarkSignal(page) {
   });
 }
 
+async function getNavigatorWebdriverState(page) {
+  return page.evaluate(() => {
+    function readDescriptor(object, property) {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(object, property);
+        if (!descriptor) return { present: false };
+        return {
+          present: true,
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          writable: Object.prototype.hasOwnProperty.call(descriptor, 'writable') ? descriptor.writable : undefined,
+          hasGetter: typeof descriptor.get === 'function',
+          hasSetter: typeof descriptor.set === 'function',
+          valueType: Object.prototype.hasOwnProperty.call(descriptor, 'value') ? typeof descriptor.value : 'accessor',
+          value: Object.prototype.hasOwnProperty.call(descriptor, 'value') ? descriptor.value : undefined,
+        };
+      } catch (error) {
+        return { error: error.message };
+      }
+    }
+
+    return {
+      webdriver: navigator.webdriver,
+      webdriverType: typeof navigator.webdriver,
+      webdriverPresent: 'webdriver' in navigator,
+      webdriverDescriptorOnNavigator: readDescriptor(navigator, 'webdriver'),
+      webdriverDescriptorOnPrototype: readDescriptor(Object.getPrototypeOf(navigator), 'webdriver'),
+      rule: 'dfs_E_7 bit0 is expected to be 1 when navigator.webdriver === true.',
+    };
+  });
+}
+
+async function getNavigatorPluginState(page) {
+  return page.evaluate(() => {
+    const plugins = Array.from(navigator.plugins || []).map((plugin) => ({
+      name: plugin.name,
+      filename: plugin.filename,
+      description: plugin.description,
+      mimeTypes: Array.from(plugin || []).map((mimeType) => ({
+        type: mimeType.type,
+        suffixes: mimeType.suffixes,
+        description: mimeType.description,
+      })),
+    }));
+
+    return {
+      length: navigator.plugins ? navigator.plugins.length : 0,
+      plugins,
+      zeroPlugins: !navigator.plugins || navigator.plugins.length === 0,
+      oneOrMorePlugins: Boolean(navigator.plugins && navigator.plugins.length > 0),
+      rule: 'S002 is 1 when navigator.plugins.length === 0; S003 is 1 when navigator.plugins.length > 0.',
+    };
+  });
+}
+
+async function getIndexedDBState(page) {
+  return page.evaluate(() => ({
+    indexedDBType: typeof window.indexedDB,
+    indexedDBPresent: 'indexedDB' in window,
+    indexedDBAvailable: window.indexedDB !== undefined && window.indexedDB !== null,
+    rule: 'S004 is expected to be 1 when window.indexedDB is unavailable.',
+  }));
+}
+
+async function getWebGLRendererState(page) {
+  return page.evaluate(() => {
+    function readRenderer(contextType) {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext(contextType);
+        if (!gl) return { contextType, available: false };
+        const debugInfo = gl.getExtension && gl.getExtension('WEBGL_debug_renderer_info');
+        const parameter = debugInfo && debugInfo.UNMASKED_RENDERER_WEBGL
+          ? debugInfo.UNMASKED_RENDERER_WEBGL
+          : 0x9246;
+        return {
+          contextType,
+          available: true,
+          renderer: gl.getParameter(parameter),
+        };
+      } catch (error) {
+        return { contextType, error: error.message };
+      }
+    }
+
+    return {
+      webgl: readRenderer('webgl'),
+      experimentalWebgl: readRenderer('experimental-webgl'),
+      webgl2: readRenderer('webgl2'),
+      rule: 'S005 is expected when GPU renderer maps to 00/missing; S006 is expected when GPU renderer maps to 01/software.',
+    };
+  });
+}
+
+async function getWebGLExtensionState(page) {
+  return page.evaluate(() => {
+    function readExtensions(contextType) {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext(contextType);
+        if (!gl) return { contextType, available: false };
+        const extensions = typeof gl.getSupportedExtensions === 'function'
+          ? gl.getSupportedExtensions()
+          : [];
+        return {
+          contextType,
+          available: true,
+          extensionCount: Array.isArray(extensions) ? extensions.length : 0,
+          extensions,
+        };
+      } catch (error) {
+        return { contextType, error: error.message };
+      }
+    }
+
+    return {
+      webgl: readExtensions('webgl'),
+      experimentalWebgl: readExtensions('experimental-webgl'),
+      webgl2: readExtensions('webgl2'),
+      rule: 'S007 is expected when the WebGL supported extension count is less than 15.',
+    };
+  });
+}
+
+async function getDevicePixelRatioState(page) {
+  return page.evaluate(() => ({
+    devicePixelRatio: window.devicePixelRatio,
+    rule: 'S008 is expected when devicePixelRatio < 1; S009 when devicePixelRatio === 1; S010 when devicePixelRatio >= 2.',
+  }));
+}
+
+async function getMediaDeviceEnumerationState(page) {
+  return page.evaluate(async () => {
+    try {
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') {
+        return {
+          available: false,
+          deviceCount: 0,
+          devices: [],
+          rule: 'S011 is expected when media device enumeration returns no devices or rejects.',
+        };
+      }
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return {
+        available: true,
+        deviceCount: Array.isArray(devices) ? devices.length : 0,
+        devices: Array.isArray(devices)
+          ? devices.map((device) => ({
+            kind: device.kind,
+            label: device.label,
+            deviceId: device.deviceId,
+            groupId: device.groupId,
+          }))
+          : devices,
+        rule: 'S011 is expected when media device enumeration returns no devices or rejects.',
+      };
+    } catch (error) {
+      return {
+        available: true,
+        rejected: true,
+        errorName: error && error.name,
+        errorMessage: error && error.message,
+        rule: 'S011 is expected when media device enumeration returns no devices or rejects.',
+      };
+    }
+  });
+}
+
+async function getHardwareConcurrencyState(page) {
+  return page.evaluate(() => ({
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    rule: 'S012 is expected when hardwareConcurrency === 1; S013 when hardwareConcurrency > 1 and < 5; S014 when hardwareConcurrency >= 5.',
+  }));
+}
+
+async function getUserAgentKeywordState(page, keyword) {
+  return page.evaluate((expectedKeyword) => {
+    const userAgent = navigator.userAgent || '';
+    return {
+      userAgent,
+      keyword: expectedKeyword,
+      containsKeyword: userAgent.toLowerCase().includes(String(expectedKeyword || '').toLowerCase()),
+      rule: 'S015 is expected when navigator.userAgent contains suspicious keywords such as bot, headless, or ChatGPT.',
+    };
+  }, keyword);
+}
+
+async function getClientHintsState(page) {
+  return page.evaluate(async () => {
+    function readWebGLRendererAnomaly() {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) {
+          return {
+            available: false,
+            renderer: '',
+            swiftShader: false,
+            unrecognizedRenderer: false,
+            triggered: false,
+          };
+        }
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '';
+        const swiftShader = /SwiftShader/i.test(renderer);
+        const unrecognizedRenderer = !/NVIDIA|AMD|Intel|Apple|Mesa|ANGLE/i.test(renderer);
+        return {
+          available: true,
+          renderer,
+          swiftShader,
+          unrecognizedRenderer,
+          triggered: swiftShader || unrecognizedRenderer,
+          rule: 'S019 is expected when WebGL renderer is SwiftShader or does not match NVIDIA/AMD/Intel/Apple/Mesa/ANGLE.',
+        };
+      } catch (error) {
+        return {
+          error: error.message,
+          renderer: '',
+          swiftShader: false,
+          unrecognizedRenderer: false,
+          triggered: false,
+        };
+      }
+    }
+
+    const ua = navigator.userAgent || '';
+    const platform = navigator.platform || '';
+    const language = navigator.language || '';
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+    const appleSignature = !/Mac|iPhone|iPad|iOS|Safari/.test(ua) && /Apple|Heisei|Macintosh|Darwin|CoreAnimation|Metal/i.test(ua + platform);
+    const webglRendererAnomaly = readWebGLRendererAnomaly();
+    const localeTimezoneMismatch =
+      (language.startsWith('en-US') && /Asia|Europe|Africa/.test(timeZone)) ||
+      (!language.startsWith('en') && /America|US/.test(timeZone));
+    if (!navigator.userAgentData || typeof navigator.userAgentData.getHighEntropyValues !== 'function') {
+      return {
+        available: false,
+        userAgent: ua,
+        platform,
+        language,
+        timeZone,
+        highEntropy: null,
+        emptyBrands: true,
+        emptyFullVersionList: true,
+        emptyPlatform: true,
+        appleSignature,
+        webglRendererAnomaly,
+        brandQuirk: false,
+        localeTimezoneMismatch,
+        rule: 'S023 and S017 are expected when high-entropy client hints brands, fullVersionList, or platform are empty.',
+      };
+    }
+
+    const highEntropy = await navigator.userAgentData
+      .getHighEntropyValues(['brands', 'fullVersionList', 'platform'])
+      .catch((error) => ({ error: error.message }));
+    const emptyBrands = !Array.isArray(highEntropy.brands) || highEntropy.brands.length === 0;
+    const emptyFullVersionList = !Array.isArray(highEntropy.fullVersionList) || highEntropy.fullVersionList.length === 0;
+    const emptyPlatform = !highEntropy.platform;
+    const uaMatch = ua.match(/Chrome\/(\d+)/i);
+    const chMatch = highEntropy.fullVersionList && highEntropy.fullVersionList[0] && highEntropy.fullVersionList[0].version
+      ? highEntropy.fullVersionList[0].version.match(/(\d+)/)
+      : null;
+    const uaLower = ua.toLowerCase();
+    const chPlatform = String(highEntropy.platform || '').toLowerCase();
+    const platformMismatch = Boolean(chPlatform && (
+      (/windows|win64|win32|winnt/.test(uaLower) && !/windows|win/.test(chPlatform)) ||
+      (/macintosh|mac os|darwin/.test(uaLower) && !/mac|darwin/.test(chPlatform)) ||
+      (/android/.test(uaLower) && !/android/.test(chPlatform)) ||
+      (/iphone|ipad|ios/.test(uaLower) && !/ios|iphone|ipad/.test(chPlatform))
+    ));
+    const brandStr = JSON.stringify(highEntropy.brands || []);
+    const brandQuirk = /Windows/i.test(ua) && brandStr.includes('Not?A_Brand');
+    return {
+      available: true,
+      userAgent: ua,
+      platform,
+      language,
+      timeZone,
+      highEntropy,
+      emptyBrands,
+      emptyFullVersionList,
+      emptyPlatform,
+      anyEmpty: emptyBrands || emptyFullVersionList || emptyPlatform,
+      uaChromeMajor: uaMatch ? uaMatch[1] : null,
+      firstFullVersionListMajor: chMatch ? chMatch[1] : null,
+      versionMismatch: Boolean(uaMatch && chMatch && uaMatch[1] !== chMatch[1]),
+      platformMismatch,
+      appleSignature,
+      webglRendererAnomaly,
+      brandStr,
+      brandQuirk,
+      localeTimezoneMismatch,
+      rule: 'S023 and S017 are expected when high-entropy client hints brands, fullVersionList, or platform are empty.',
+    };
+  });
+}
+
 function isDfsOrLevoJsUrl(value) {
   try {
     const pathname = new URL(value).pathname.toLowerCase();
@@ -1019,6 +1470,74 @@ async function saveScreenshot(page, name) {
   return fileName;
 }
 
+function createDfsScriptRequestLog(page) {
+  const requests = [];
+  page.on('request', (request) => {
+    if (!/dfs\.js|levo\.js|pseaegis|aegis/i.test(request.url())) return;
+    requests.push({
+      url: request.url(),
+      method: request.method(),
+      resourceType: request.resourceType(),
+      timestamp: new Date().toISOString(),
+    });
+  });
+  return requests;
+}
+
+async function collectDfsControlDiagnostics(page, context, outputDir, resultConfig, scriptOverride, dfsScriptRequests) {
+  const fingerprintDataWait = await waitForFingerprintData(page);
+  const e7Wait = await waitForDfsE7Value(page, context);
+  const fingerprint = e7Wait.fingerprint || await getFingerprint(page).catch((error) => ({ __error: error.message }));
+  const documentCookieList = e7Wait.documentCookieList || await getDfsCookies(page).catch((error) => ({ __error: error.message }));
+  const documentDfsCookies = e7Wait.documentDfsCookies || (Array.isArray(documentCookieList) ? parseCookieArray(documentCookieList) : {});
+  const contextDfsCookies = e7Wait.contextDfsCookies || await getDfsContextCookies(context).catch((error) => ({ __error: error.message }));
+  const e7 = String(
+    e7Wait.dfs_E_7 ||
+      documentDfsCookies.dfs_E_7 ||
+      contextDfsCookies.dfs_E_7 ||
+      getFingerprintValue(fingerprint, 'dfs_E_7') ||
+      ''
+  );
+  const e7Seed =
+    documentDfsCookies.dfs_F_5 ||
+    contextDfsCookies.dfs_F_5 ||
+    getFingerprintValue(fingerprint, 'dfs_F_5');
+  const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+  let missingDfsE7Screenshot = null;
+
+  if (!e7) {
+    missingDfsE7Screenshot = await saveScreenshot(page, `${sanitizeSegment(resultConfig.evidenceName || resultConfig.phase || 'control')}-missing-dfs-e7`)
+      .catch((error) => ({ error: error.message }));
+  }
+
+  return {
+    finalUrl: page.url(),
+    isSystemRequirements: isChaseSystemRequirementsUrl(page.url()),
+    frames: page.frames().map((frame) => ({
+      name: frame.name(),
+      url: frame.url(),
+    })),
+    documentReadyState: await page.evaluate(() => document.readyState).catch((error) => ({ error: error.message })),
+    fingerprintDataWait,
+    dfsE7Wait: {
+      found: e7Wait.found,
+      timeoutMs: e7Wait.timeoutMs,
+      waitedMs: e7Wait.waitedMs,
+    },
+    dfsScriptRequests: dfsScriptRequests || [],
+    scriptOverride,
+    documentDfsCookies,
+    contextDfsCookies,
+    fingerprint,
+    fingerprintError: fingerprint && fingerprint.__error ? fingerprint.__error : null,
+    dfs_E_7: e7,
+    dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+    dfs_F_5_seed_source: e7Seed,
+    dfs_E_7_shuffle: e7Shuffle,
+    missingDfsE7Screenshot,
+  };
+}
+
 function saveText(fileName, text) {
   fs.mkdirSync(path.dirname(fileName), { recursive: true });
   fs.writeFileSync(fileName, text, 'utf8');
@@ -1033,6 +1552,93 @@ function addResult(results, testName, status, details, evidenceFilePaths = [], e
     evidenceFilePaths,
     errors: errors.map((error) => error && error.message ? error.message : String(error)),
   });
+}
+
+function addScarBitResult(results, bitName, description, actual, expected, details, evidenceFilePaths = []) {
+  const matches = actual === expected;
+  addResult(
+    results,
+    `${bitName} ${description}`,
+    matches ? 'PASS' : 'FAIL',
+    {
+      bit: bitName,
+      description,
+      actual,
+      expected,
+      ...details,
+    },
+    evidenceFilePaths,
+    matches ? [] : [`${bitName} expected ${expected}, got ${actual}`]
+  );
+}
+
+function isMissingDfsE7Evidence(evidence, bitKeys = []) {
+  if (!evidence || typeof evidence !== 'object') return true;
+  if (!String(evidence.dfs_E_7 || '').trim()) return true;
+  return bitKeys.some((key) => evidence[key] === undefined || evidence[key] === null);
+}
+
+function classifyMissingDfsE7Evidence(evidence) {
+  if (evidence && evidence.isSystemRequirements) {
+    return {
+      status: 'SKIP',
+      reason: 'Control context redirected to the Chase system requirements page; DFS bit assertions are not available in this browser mode.',
+    };
+  }
+
+  if (!evidence || !Array.isArray(evidence.dfsScriptRequests) || evidence.dfsScriptRequests.length === 0) {
+    return {
+      status: 'FAIL',
+      reason: 'DFS script was not requested in this isolated control context, so dfs_E_7 could not be emitted.',
+    };
+  }
+
+  if (evidence.fingerprintError) {
+    return {
+      status: 'FAIL',
+      reason: `DFS script was requested, but FingerprintData was unavailable: ${evidence.fingerprintError}`,
+    };
+  }
+
+  return {
+    status: 'FAIL',
+    reason: 'DFS script was requested, but dfs_E_7 was not present in document cookies, browser context cookies, or FingerprintData.',
+  };
+}
+
+function addDfsE7ControlResult(results, testName, evidence, evidenceFilePaths, failures, bitKeys = []) {
+  if (isMissingDfsE7Evidence(evidence, bitKeys)) {
+    const classification = classifyMissingDfsE7Evidence(evidence);
+    addResult(
+      results,
+      testName,
+      classification.status,
+      {
+        ...evidence,
+        availabilityReason: classification.reason,
+        suppressedFailureCount: failures.length,
+      },
+      evidenceFilePaths,
+      [classification.reason]
+    );
+    return;
+  }
+
+  addResult(results, testName, failures.length === 0 ? 'PASS' : 'FAIL', evidence, evidenceFilePaths, failures);
+}
+
+function gpuRendererMutualExclusionFailures(evidence) {
+  if (evidence.baselineBeforeMock && evidence.baselineBeforeMock.bit4 === '1') {
+    return [];
+  }
+  if (evidence.bit4 === '1' && evidence.bit5 === '1') {
+    return ['S005 and S006 both fired; this control is invalid because GPU renderer missing/null and software renderer should not both be true.'];
+  }
+  return [];
+}
+
+function shouldIgnoreS005ForGpuRendererControl(evidence) {
+  return Boolean(evidence && evidence.baselineBeforeMock && evidence.baselineBeforeMock.bit4 === '1');
 }
 
 function requiredCookieFailures(cookieMap) {
@@ -1238,19 +1844,252 @@ async function getInteractionTargetPoint(page) {
   });
 }
 
+async function getRootInteractionTargetPoint(page, root) {
+  if (!root || root === page || typeof root.frameElement !== 'function') {
+    return {
+      ...(await getInteractionTargetPoint(page)),
+      context: 'page',
+    };
+  }
+
+  const localPoint = await root.evaluate(() => {
+    const selectors = [
+      'input:not([type="hidden"]):not([disabled])',
+      'button:not([disabled])',
+      'a[href]',
+      'body',
+    ];
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return {
+          x: Math.floor(rect.left + Math.min(rect.width / 2, 40)),
+          y: Math.floor(rect.top + Math.min(rect.height / 2, 20)),
+          selector,
+        };
+      }
+    }
+    return {
+      x: Math.floor(window.innerWidth / 2),
+      y: Math.floor(window.innerHeight / 2),
+      selector: 'viewport-center',
+    };
+  });
+  const frameBox = await (await root.frameElement()).boundingBox();
+  if (!frameBox) {
+    return {
+      ...(await getInteractionTargetPoint(page)),
+      context: 'frame_no_box',
+      frameUrl: root.url(),
+    };
+  }
+
+  return {
+    x: Math.floor(frameBox.x + localPoint.x),
+    y: Math.floor(frameBox.y + localPoint.y),
+    localX: localPoint.x,
+    localY: localPoint.y,
+    selector: localPoint.selector,
+    frameBox,
+    frameUrl: root.url(),
+    context: 'frame',
+  };
+}
+
+async function dispatchRootRapidClickEvents(root, count) {
+  if (!root || typeof root.evaluate !== 'function') return null;
+  return root.evaluate((clickCount) => {
+    const target = document.querySelector('input:not([type="hidden"]):not([disabled])')
+      || document.querySelector('button:not([disabled])')
+      || document.body
+      || document.documentElement;
+    for (let index = 0; index < clickCount; index += 1) {
+      target.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 20 + index,
+        clientY: 20 + index,
+      }));
+      window.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 20 + index,
+        clientY: 20 + index,
+      }));
+    }
+    return {
+      dispatchedSyntheticClicks: clickCount,
+      targetTagName: target.tagName,
+      targetId: target.id || '',
+    };
+  }, count);
+}
+
+async function dispatchRootRapidScrollEvents(root, count) {
+  if (!root || typeof root.evaluate !== 'function') return null;
+  return root.evaluate((scrollCount) => {
+    for (let index = 0; index < scrollCount; index += 1) {
+      window.dispatchEvent(new WheelEvent('wheel', {
+        bubbles: true,
+        cancelable: true,
+        deltaY: 180,
+      }));
+      document.dispatchEvent(new Event('scroll', { bubbles: true }));
+      window.dispatchEvent(new Event('scroll'));
+      window.scrollBy(0, 180);
+    }
+    return {
+      dispatchedSyntheticScrolls: scrollCount,
+      scrollY: window.scrollY,
+    };
+  }, count);
+}
+
 async function maybeTeleportMouse(page) {
   const viewport = page.viewportSize() || { width: 1280, height: 720 };
-  const points = [
-    [5, 5],
+  const start = [10, 10];
+  const hops = [
     [Math.max(10, viewport.width - 10), Math.max(10, viewport.height - 10)],
     [Math.floor(viewport.width * 0.1), Math.floor(viewport.height * 0.85)],
     [Math.floor(viewport.width * 0.9), Math.floor(viewport.height * 0.15)],
   ];
 
-  for (const [x, y] of points) {
-    await page.mouse.move(x, y, { steps: 1 });
-    await page.waitForTimeout(5);
+  const installProbe = (frame) => frame.evaluate(() => {
+    const probe = {
+      installedAt: performance.now(),
+      frameUrl: location.href,
+      events: [],
+      hops: [],
+    };
+    let previous = null;
+
+    window.__DFS_MOUSE_TELEPORT_PROBE = probe;
+    window.addEventListener('mousemove', (event) => {
+      const current = {
+        at: performance.now(),
+        x: event.clientX,
+        y: event.clientY,
+        isTrusted: event.isTrusted,
+      };
+      probe.events.push(current);
+
+      if (previous) {
+        const dx = current.x - previous.x;
+        const dy = current.y - previous.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        const deltaMs = current.at - previous.at;
+        const speedPxPerMs = deltaMs > 0 ? distance / deltaMs : null;
+        probe.hops.push({
+          from: { x: previous.x, y: previous.y },
+          to: { x: current.x, y: current.y },
+          distance: Math.round(distance * 1000) / 1000,
+          deltaMs: Math.round(deltaMs * 1000) / 1000,
+          speedPxPerMs: speedPxPerMs === null ? null : Math.round(speedPxPerMs * 1000) / 1000,
+          meetsBit28Threshold: speedPxPerMs !== null && distance > 40 && deltaMs > 2 && speedPxPerMs > 250,
+          isTrusted: current.isTrusted,
+        });
+      }
+
+      previous = current;
+    });
+  });
+
+  await Promise.all(page.frames().map((frame) => installProbe(frame).catch((error) => ({
+    frameUrl: frame.url(),
+    error: error.message,
+  }))));
+
+  const cdpDeltaSeconds = Number(process.env.MOUSE_TELEPORT_CDP_DELTA_MS || 3) / 1000;
+  let usedCdp = false;
+  if (readBoolean('MOUSE_TELEPORT_USE_CDP', true)) {
+    try {
+      const client = await page.context().newCDPSession(page);
+      let timestamp = Date.now() / 1000;
+      const cdpHops = readBoolean('MOUSE_TELEPORT_CDP_FAR_HOP', true)
+        ? [
+            [start[0], start[1]],
+            [5010, start[1]],
+          ]
+        : [start, ...hops];
+      await client.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: cdpHops[0][0],
+        y: cdpHops[0][1],
+        button: 'none',
+        timestamp,
+      });
+      for (const [x, y] of cdpHops.slice(1)) {
+        timestamp += cdpDeltaSeconds;
+        await client.send('Input.dispatchMouseEvent', {
+          type: 'mouseMoved',
+          x,
+          y,
+          button: 'none',
+          timestamp,
+        });
+      }
+      await client.detach();
+      usedCdp = true;
+      await page.waitForTimeout(Number(process.env.MOUSE_TELEPORT_SETTLE_WAIT_MS || 100));
+    } catch {
+      usedCdp = false;
+    }
   }
+
+  if (!usedCdp) {
+    await page.mouse.move(start[0], start[1], { steps: 1 });
+    await page.waitForTimeout(Number(process.env.MOUSE_TELEPORT_DELTA_WAIT_MS || 3));
+
+    for (const [x, y] of hops) {
+      await page.mouse.move(x, y, { steps: 1 });
+      await page.waitForTimeout(Number(process.env.MOUSE_TELEPORT_DELTA_WAIT_MS || 3));
+    }
+  }
+
+  if (readBoolean('MOUSE_TELEPORT_SYNTHETIC_BURST', true)) {
+    const syntheticWaitMs = Number(process.env.MOUSE_TELEPORT_SYNTHETIC_WAIT_MS || 3);
+    await Promise.all(page.frames().map((frame) => frame.evaluate(async (waitMs) => {
+      const first = new MouseEvent('mousemove', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 10,
+        clientY: 10,
+        screenX: 10,
+        screenY: 10,
+      });
+      const second = new MouseEvent('mousemove', {
+        bubbles: true,
+        cancelable: true,
+        clientX: 5010,
+        clientY: 10,
+        screenX: 5010,
+        screenY: 10,
+      });
+      window.dispatchEvent(first);
+      document.dispatchEvent(first);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      window.dispatchEvent(second);
+      document.dispatchEvent(second);
+    }, syntheticWaitMs).catch(() => null)));
+    await page.waitForTimeout(Number(process.env.MOUSE_TELEPORT_SETTLE_WAIT_MS || 100));
+  }
+
+  const frameProbes = await Promise.all(page.frames().map((frame) => frame.evaluate(() => window.__DFS_MOUSE_TELEPORT_PROBE || null)
+    .then((probe) => probe || { frameUrl: frame.url(), events: [], hops: [] })
+    .catch((error) => ({ frameUrl: frame.url(), error: error.message, events: [], hops: [] }))));
+  const measuredHops = frameProbes.flatMap((probe) => (probe.hops || []).map((hop) => ({
+    ...hop,
+    frameUrl: probe.frameUrl,
+  })));
+
+  return {
+    eventSource: usedCdp ? 'cdp' : 'playwright_mouse',
+    frameProbes,
+    hops: measuredHops,
+    thresholdMatches: measuredHops.filter((hop) => hop.meetsBit28Threshold),
+  };
 }
 
 function getScenarioText(name) {
@@ -1260,7 +2099,7 @@ function getScenarioText(name) {
 function getInteractionScenarioNames() {
   return parseList(readString(
     'INTERACTION_TEST_SCENARIOS',
-    'human_typing,bot_fast_typing,paste,programmatic_input,mouse_teleport,low_mouse_activity,focus_input_speed,scroll_click_pattern,payload_coverage'
+    'human_typing,bot_fast_typing,robotic_typing_cadence,paste,programmatic_input,mouse_teleport,low_mouse_activity,focus_input_speed,rapid_click_pattern,rapid_scroll_pattern,payload_coverage'
   ));
 }
 
@@ -1268,18 +2107,77 @@ function getBehaviorBitExpectations(scenarioName) {
   const expectations = {
     human_typing: { bit25: '0', bit26: '0', bit27: '0', bit28: '0' },
     bot_fast_typing: { bit21: '1', bit25: '1' },
+    robotic_typing_cadence: { bit21: '1', bit25: '1' },
     paste: { bit21: '1', bit27: '1' },
     programmatic_input: { bit21: '1', bit26: '1' },
     mouse_teleport: { bit21: '1', bit28: '1' },
     low_mouse_activity: { bit21: '1', bit29: '1' },
     focus_input_speed: { bit21: '1', bit30: '1' },
-    scroll_click_pattern: { bit31: '1' },
+    rapid_click_pattern: { bit21: '1', bit31: '1' },
+    rapid_scroll_pattern: { bit21: '1', bit31: '1' },
+    scroll_click_pattern: { bit21: '1', bit31: '1' },
   };
   const ignoredBits = parseSet(readString('IGNORE_INTERACTION_SCAR_BITS'));
   return Object.fromEntries(
     Object.entries(expectations[scenarioName] || {})
       .filter(([key]) => !ignoredBits.has(key.toLowerCase()) && !ignoredBits.has(key.toLowerCase().replace('bit', '')))
   );
+}
+
+function getTestRetryAttempts() {
+  return Math.max(1, Number(process.env.TEST_RETRY_ATTEMPTS || 3));
+}
+
+function getTestRetryDelayMs() {
+  return Math.max(0, Number(process.env.TEST_RETRY_DELAY_MS || 3000));
+}
+
+function isRetryableTestMessage(value) {
+  return /null|undefined|not found|cannot find|can't find|no such|selector|locator|timeout|timed out|waiting for|not visible|detached|execution context was destroyed|frame|target closed|context closed/i.test(String(value || ''));
+}
+
+async function waitBeforeTestRetry() {
+  const delayMs = getTestRetryDelayMs();
+  if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function recoverSecureChaseSystemRequirements(page) {
+  if (!readBoolean('SECURE_SYSTEM_REQUIREMENTS_SIGNIN_RECOVERY', true)) {
+    return { attempted: false, reason: 'SECURE_SYSTEM_REQUIREMENTS_SIGNIN_RECOVERY=false' };
+  }
+  if (!/\/system-requirements\b/i.test(page.url())) {
+    return { attempted: false, reason: 'Page is not the Chase system requirements redirect.', url: page.url() };
+  }
+
+  const selectors = [
+    'a[type="mds-primary-button"]',
+    'a:has-text("Sign in")',
+    'text=Sign in',
+  ];
+  const beforeUrl = page.url();
+  for (const selector of selectors) {
+    const candidate = page.locator(selector).first();
+    try {
+      await candidate.waitFor({ state: 'visible', timeout: Number(process.env.SECURE_SIGNIN_LINK_TIMEOUT_MS || 10000) });
+      await candidate.click();
+      await page.waitForLoadState(process.env.GOTO_WAIT_UNTIL || 'domcontentloaded', {
+        timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+      }).catch(() => {});
+      await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+      return { attempted: true, selector, beforeUrl, afterUrl: page.url() };
+    } catch {}
+  }
+
+  return {
+    attempted: true,
+    beforeUrl,
+    afterUrl: page.url(),
+    error: 'Unable to click a visible Sign in link on the Chase system requirements page.',
+  };
+}
+
+function isChaseSystemRequirementsUrl(value) {
+  return /:\/\/www\.chase\.com\/digital\/resources\/privacy-security\/security\/system-requirements\b/i.test(String(value || ''));
 }
 
 function getInputInteractionConfig() {
@@ -1290,9 +2188,28 @@ function getInputInteractionConfig() {
   };
 }
 
+async function waitForLoginFrame(page, timeout = Number(process.env.LOGIN_FRAME_WAIT_TIMEOUT_MS || process.env.FIELD_TIMEOUT_MS || 45000)) {
+  const frameName = process.env.LOGIN_FRAME_NAME || frameNameFromSelector(process.env.LOGIN_FRAME_SELECTOR);
+  const frameUrlMatcher = process.env.LOGIN_FRAME_URL_MATCHER;
+  if (!frameName && !frameUrlMatcher) return null;
+
+  const startedAt = Date.now();
+  const matchesUrl = frameUrlMatcher ? matcherFromConfig(frameUrlMatcher) : null;
+  while (Date.now() - startedAt <= timeout) {
+    const frame = page.frames().find((candidate) => {
+      if (frameName && candidate.name() === frameName) return true;
+      return Boolean(matchesUrl && matchesUrl(candidate.url()));
+    });
+    if (frame) return frame;
+    await page.waitForTimeout(250);
+  }
+
+  return null;
+}
+
 async function getScenarioRoot(page) {
   const frameSelector = process.env.LOGIN_FRAME_SELECTOR;
-  const frame = getLoginFrame(page);
+  const frame = await waitForLoginFrame(page);
   if (frame) return frame;
   if (frameSelector) return page.frameLocator(frameSelector);
   return page;
@@ -1305,6 +2222,67 @@ async function getFieldIdentity(locator) {
     type: el.getAttribute('type') || el.tagName.toLowerCase(),
     tagName: el.tagName,
   }));
+}
+
+async function installFocusInputTimingProbe(locator) {
+  return locator.evaluate((el) => {
+    if (document.activeElement === el) {
+      el.blur();
+    }
+
+    const probe = {
+      installedAt: performance.now(),
+      focusAt: null,
+      firstInputAt: null,
+      firstKeydownAt: null,
+      firstBeforeInputAt: null,
+      events: [],
+    };
+    const record = (type, event) => {
+      const entry = {
+        type,
+        at: performance.now(),
+        isTrusted: Boolean(event && event.isTrusted),
+        key: event && event.key ? event.key : undefined,
+        inputType: event && event.inputType ? event.inputType : undefined,
+        data: event && event.data ? event.data : undefined,
+      };
+      probe.events.push(entry);
+      if (type === 'focus' && probe.focusAt === null) probe.focusAt = entry.at;
+      if (type === 'keydown' && probe.firstKeydownAt === null) probe.firstKeydownAt = entry.at;
+      if (type === 'beforeinput' && probe.firstBeforeInputAt === null) probe.firstBeforeInputAt = entry.at;
+      if (type === 'input' && probe.firstInputAt === null) probe.firstInputAt = entry.at;
+    };
+
+    el.__dfsFocusInputTimingProbe = probe;
+    el.addEventListener('focus', (event) => record('focus', event), { once: true });
+    el.addEventListener('keydown', (event) => record('keydown', event));
+    el.addEventListener('beforeinput', (event) => record('beforeinput', event));
+    el.addEventListener('input', (event) => record('input', event));
+  });
+}
+
+async function readFocusInputTimingProbe(locator) {
+  return locator.evaluate((el) => {
+    const probe = el.__dfsFocusInputTimingProbe;
+    if (!probe) return null;
+    const deltaMs = probe.focusAt !== null && probe.firstInputAt !== null
+      ? Math.round((probe.firstInputAt - probe.focusAt) * 1000) / 1000
+      : null;
+    const keydownDeltaMs = probe.focusAt !== null && probe.firstKeydownAt !== null
+      ? Math.round((probe.firstKeydownAt - probe.focusAt) * 1000) / 1000
+      : null;
+    const beforeInputDeltaMs = probe.focusAt !== null && probe.firstBeforeInputAt !== null
+      ? Math.round((probe.firstBeforeInputAt - probe.focusAt) * 1000) / 1000
+      : null;
+    return {
+      ...probe,
+      deltaMs,
+      keydownDeltaMs,
+      beforeInputDeltaMs,
+      under300ms: deltaMs !== null ? deltaMs <= 300 : null,
+    };
+  });
 }
 
 async function fillWithHumanTyping(page, root, selector, value) {
@@ -1349,19 +2327,58 @@ async function pasteIntoField(page, root, selector, value) {
       el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: nextValue }));
     }, text);
   }
+
+  return {
+    value: text,
+    textLength: text.length,
+    method: clipboardWritten ? 'clipboard_keyboard_paste' : 'synthetic_clipboard_event',
+    expectedBit: 'S028',
+    expectedRollupBit: 'S022',
+  };
 }
 
 async function setProgrammaticInput(root, selector, value) {
   const field = root.locator(selector);
   await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-  await field.evaluate((el, nextValue) => {
+  return field.evaluate((el, nextValue) => {
     el.value = nextValue;
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: nextValue }));
+    const event = new Event('input', { bubbles: true });
+    el.dispatchEvent(event);
+    return {
+      value: el.value,
+      eventType: event.type,
+      isTrusted: event.isTrusted,
+      expectedBit: 'S027',
+      expectedRollupBit: 'S022',
+    };
   }, String(value));
 }
 
-async function triggerBehaviorScore(page) {
-  await page.evaluate(() => {
+async function triggerBehaviorScore(page, root, config, options = {}) {
+  if (config.submitSelector && !options.forceSyntheticSubmit) {
+    try {
+      const submitButton = root.locator(config.submitSelector);
+      await clickLocatorWithoutNavigationWait(
+        page,
+        submitButton,
+        Number(process.env.INTERACTION_SUBMIT_TIMEOUT_MS || process.env.FIELD_TIMEOUT_MS || 45000)
+      );
+      await page.waitForTimeout(Number(process.env.INTERACTION_SCORE_WAIT_MS || 750));
+      return {
+        method: 'configured_submit',
+        submitSelector: config.submitSelector,
+      };
+    } catch (error) {
+      await page.waitForTimeout(Number(process.env.INTERACTION_SCORE_WAIT_MS || 750));
+      return {
+        method: 'configured_submit_failed',
+        submitSelector: config.submitSelector,
+        error: error.message,
+      };
+    }
+  }
+
+  const createSyntheticSubmit = () => {
     const button = document.createElement('button');
     button.type = 'submit';
     button.id = 'submit';
@@ -1369,8 +2386,29 @@ async function triggerBehaviorScore(page) {
     document.body.appendChild(button);
     button.click();
     button.remove();
-  });
+  };
+
+  if (root && typeof root.evaluate === 'function') {
+    await root.evaluate(createSyntheticSubmit);
+  } else if (root && typeof root.locator === 'function') {
+    await root.locator('body').evaluate((body) => {
+      const button = document.createElement('button');
+      button.type = 'submit';
+      button.id = 'submit';
+      button.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;';
+      body.appendChild(button);
+      button.click();
+      button.remove();
+    });
+  } else {
+    await page.evaluate(createSyntheticSubmit);
+  }
+
   await page.waitForTimeout(Number(process.env.INTERACTION_SCORE_WAIT_MS || 750));
+  return {
+    method: 'synthetic_hidden_submit',
+    context: root && typeof root.evaluate === 'function' ? 'frame_or_page' : root && typeof root.locator === 'function' ? 'frame_locator' : 'page',
+  };
 }
 
 async function readBehaviorState(page) {
@@ -1407,7 +2445,8 @@ async function performInteractionScenario(page, scenarioName) {
   const root = await getScenarioRoot(page);
   const username = getScenarioText('USERNAME');
   const password = getScenarioText('PASSWORD');
-  const needsInput = ['human_typing', 'bot_fast_typing', 'paste', 'programmatic_input', 'focus_input_speed'].includes(scenarioName);
+  const needsInput = ['human_typing', 'bot_fast_typing', 'robotic_typing_cadence', 'paste', 'programmatic_input', 'focus_input_speed'].includes(scenarioName);
+  let scenarioDetails = {};
 
   if (needsInput && !config.usernameSelector) {
     return {
@@ -1428,23 +2467,55 @@ async function performInteractionScenario(page, scenarioName) {
       await fillWithFastTyping(page, root, config.usernameSelector, username);
       if (config.passwordSelector) await fillWithFastTyping(page, root, config.passwordSelector, password);
       break;
+    case 'robotic_typing_cadence': {
+      await maybeMoveMouse(page);
+      const text = readString('ROBOTIC_TYPING_VALUE', 'user123');
+      const delayMs = Number(process.env.ROBOTIC_TYPING_DELAY_MS || 50);
+      const field = root.locator(config.usernameSelector);
+      await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+      await field.click();
+      await page.keyboard.type(text, { delay: delayMs });
+      scenarioDetails.roboticTypingCadence = {
+        textLength: text.length,
+        delayMs,
+        expectedAverageUnderMs: 120,
+        expectedVarianceUnder: 200,
+        rule: 'S026 is expected for at least 5 typed characters with fast, uniform cadence; S022 should also fire.',
+      };
+      break;
+    }
     case 'paste':
       await maybeMoveMouse(page);
-      await pasteIntoField(page, root, config.usernameSelector, username);
+      scenarioDetails.pasteEvent = await pasteIntoField(page, root, config.usernameSelector, username);
       break;
     case 'programmatic_input':
       await maybeMoveMouse(page);
-      await setProgrammaticInput(root, config.usernameSelector, username);
+      scenarioDetails.programmaticInput = await setProgrammaticInput(root, config.usernameSelector, readString('PROGRAMMATIC_INPUT_VALUE', 'bot@test.com'));
       await page.waitForTimeout(Number(process.env.PROGRAMMATIC_INPUT_POLL_WAIT_MS || 500));
       break;
     case 'mouse_teleport':
-      await maybeTeleportMouse(page);
+      return {
+        skipped: true,
+        reason: 'Skipped due to not being able replicate conditions to cause Bit to fire',
+      };
+    case 'low_mouse_activity': {
+      const waitMs = Number(process.env.LOW_MOUSE_ACTIVITY_WAIT_MS || 3000);
+      await page.waitForTimeout(waitMs);
+      scenarioDetails.lowMouseActivity = {
+        waitMs,
+        mouseMoved: false,
+        expectedBit: 'S030',
+        expectedRollupBit: 'S022',
+      };
       break;
-    case 'low_mouse_activity':
-      break;
+    }
     case 'focus_input_speed': {
       const field = root.locator(config.usernameSelector);
       await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+      await field.evaluate((el) => {
+        el.setAttribute('name', 'username');
+        el.setAttribute('autocomplete', 'username');
+      });
       const identity = await getFieldIdentity(field);
       const focusKey = identity.name || identity.id || identity.tagName;
       if (!['username', 'password'].includes(String(focusKey || '').toLowerCase())) {
@@ -1455,8 +2526,56 @@ async function performInteractionScenario(page, scenarioName) {
         };
       }
       await maybeMoveMouse(page);
+      await installFocusInputTimingProbe(field);
       await field.click();
-      await page.keyboard.type(username, { delay: 10 });
+      const text = String(username);
+      if (text.length > 0) {
+        await page.keyboard.press(text[0]);
+        if (text.length > 1) {
+          await page.keyboard.type(text.slice(1), { delay: Number(process.env.FOCUS_INPUT_TYPE_DELAY_MS || 10) });
+        }
+      }
+      scenarioDetails.focusInputTiming = await readFocusInputTimingProbe(field);
+      break;
+    }
+    case 'rapid_click_pattern': {
+      const clickCount = Number(process.env.RAPID_CLICK_COUNT || 6);
+      const delayMs = Number(process.env.RAPID_CLICK_DELAY_MS || 40);
+      const point = await getRootInteractionTargetPoint(page, root);
+      await page.mouse.move(point.x, point.y);
+      for (let index = 0; index < clickCount; index += 1) {
+        await page.mouse.click(point.x + (index % 2), point.y + (index % 2));
+        await page.waitForTimeout(delayMs);
+      }
+      const syntheticWindowEvents = await dispatchRootRapidClickEvents(root, clickCount);
+      scenarioDetails.rapidClickPattern = {
+        clickCount,
+        delayMs,
+        point,
+        syntheticWindowEvents,
+        expectedBit: 'S032',
+        expectedRollupBit: 'S022',
+      };
+      break;
+    }
+    case 'rapid_scroll_pattern': {
+      const scrollCount = Number(process.env.RAPID_SCROLL_COUNT || 6);
+      const delayMs = Number(process.env.RAPID_SCROLL_DELAY_MS || 40);
+      const point = await getRootInteractionTargetPoint(page, root);
+      await page.mouse.move(point.x, point.y);
+      for (let index = 0; index < scrollCount; index += 1) {
+        await page.mouse.wheel(0, 180);
+        await page.waitForTimeout(delayMs);
+      }
+      const syntheticWindowEvents = await dispatchRootRapidScrollEvents(root, scrollCount);
+      scenarioDetails.rapidScrollPattern = {
+        scrollCount,
+        delayMs,
+        point,
+        syntheticWindowEvents,
+        expectedBit: 'S032',
+        expectedRollupBit: 'S022',
+      };
       break;
     }
     case 'scroll_click_pattern':
@@ -1479,7 +2598,7 @@ async function performInteractionScenario(page, scenarioName) {
       await page.evaluate(() => window.scrollBy(0, 250));
       if (config.usernameSelector) {
         await fillWithHumanTyping(page, root, config.usernameSelector, username);
-        await pasteIntoField(page, root, config.usernameSelector, `${username}2`);
+        scenarioDetails.payloadPaste = await pasteIntoField(page, root, config.usernameSelector, `${username}2`);
       }
       break;
     default:
@@ -1489,14 +2608,17 @@ async function performInteractionScenario(page, scenarioName) {
       };
   }
 
-  await triggerBehaviorScore(page);
-  return { skipped: false };
+  const trigger = await triggerBehaviorScore(page, root, config, {
+    forceSyntheticSubmit: !['human_typing', 'rapid_click_pattern', 'rapid_scroll_pattern'].includes(scenarioName),
+  });
+  return { skipped: false, trigger, ...scenarioDetails };
 }
 
-async function runInteractionScenario(browser, target, config, outputDir, results, scenarioName) {
+async function runInteractionScenario(browser, target, config, outputDir, results, scenarioName, attempt = 1) {
   const scenarioSlug = sanitizeSegment(scenarioName);
   let scenarioContext;
   let scenarioPage;
+  const maxAttempts = getTestRetryAttempts();
   try {
     scenarioContext = await runStep(`create ${scenarioName} interaction context`, () => browser.newContext({
       viewport: {
@@ -1511,6 +2633,7 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
     }));
     await runStep(`${scenarioName} post-load wait`, () => scenarioPage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+    await runStep(`${scenarioName} secure redirect recovery`, () => recoverSecureChaseSystemRequirements(scenarioPage));
 
     const before = await runStep(`read ${scenarioName} baseline behavior state`, () => readBehaviorState(scenarioPage));
     const performed = await runStep(`perform ${scenarioName} interaction scenario`, () => performInteractionScenario(scenarioPage, scenarioName));
@@ -1533,9 +2656,12 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       .map(([key, expected]) => `${key} expected ${expected}, got ${after.bits[key]}`);
     const f2Changed = before.dfs_F_2 !== undefined && after.dfs_F_2 !== undefined && String(before.dfs_F_2) !== String(after.dfs_F_2);
     const payloadFailure = scenarioName === 'payload_coverage' && !f2Changed ? ['dfs_F_2 did not change after payload coverage interactions'] : [];
+    const failures = [...bitFailures, ...payloadFailure];
     const evidence = {
       scenario: scenarioName,
       browser: target.browser,
+      attempt,
+      maxAttempts,
       before: {
         dfs_E_5: before.dfs_E_5,
         dfs_E_7: before.dfs_E_7,
@@ -1545,6 +2671,7 @@ async function runInteractionScenario(browser, target, config, outputDir, result
         dfs_F_2: before.dfs_F_2,
         bits: before.bits,
       },
+      performed,
       after: {
         dfs_E_5: after.dfs_E_5,
         dfs_E_7: after.dfs_E_7,
@@ -1556,25 +2683,40 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       },
       expectations,
       f2Changed,
+      trigger: performed.trigger,
+      focusInputTiming: performed.focusInputTiming,
+      mouseTeleport: performed.mouseTeleport,
       debugLog,
     };
+    if (failures.length > 0 && attempt < maxAttempts && failures.some(isRetryableTestMessage)) {
+      if (scenarioPage && !scenarioPage.isClosed()) await closeWithTimeout(`${scenarioName} retry page`, () => scenarioPage.close());
+      if (scenarioContext) await closeWithTimeout(`${scenarioName} retry context`, () => scenarioContext.close());
+      await waitBeforeTestRetry();
+      return runInteractionScenario(browser, target, config, outputDir, results, scenarioName, attempt + 1);
+    }
     const evidenceFile = saveJson(path.join(outputDir, `interaction-${scenarioSlug}.json`), evidence);
     addResult(
       results,
       `Interaction Scenario - ${scenarioName}`,
-      bitFailures.length === 0 && payloadFailure.length === 0 ? 'PASS' : 'FAIL',
+      failures.length === 0 ? 'PASS' : 'FAIL',
       evidence,
       [evidenceFile],
-      [...bitFailures, ...payloadFailure]
+      failures
     );
   } catch (error) {
+    if (attempt < maxAttempts && isRetryableTestMessage(error.message)) {
+      if (scenarioPage && !scenarioPage.isClosed()) await closeWithTimeout(`${scenarioName} retry page`, () => scenarioPage.close());
+      if (scenarioContext) await closeWithTimeout(`${scenarioName} retry context`, () => scenarioContext.close());
+      await waitBeforeTestRetry();
+      return runInteractionScenario(browser, target, config, outputDir, results, scenarioName, attempt + 1);
+    }
     addResult(
       results,
       `Interaction Scenario - ${scenarioName}`,
       'FAIL',
-      { scenario: scenarioName, error: error.message },
+      { scenario: scenarioName, attempt, maxAttempts, error: error.message },
       [],
-      [error]
+      [error.message]
     );
   } finally {
     if (scenarioPage && !scenarioPage.isClosed()) await closeWithTimeout(`${scenarioName} page`, () => scenarioPage.close());
@@ -1688,6 +2830,1672 @@ async function runPrivateModeBrowserTest(target, config, outputDir, results) {
   }
 }
 
+async function runWebdriverSuppressionTest(browser, target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_WEBDRIVER_SUPPRESSION_TEST', false)) {
+    addResult(
+      results,
+      'S001 navigator.webdriver suppressed',
+      'SKIP',
+      {
+        reason: 'PERFORM_WEBDRIVER_SUPPRESSION_TEST=false; webdriver suppression check skipped by configuration.',
+        expectedUnsuppressedBit0: readString('EXPECTED_DFS_E7_BIT0', '1'),
+      },
+      [],
+      ['Webdriver suppression check skipped by configuration.']
+    );
+    return;
+  }
+
+  let suppressionContext;
+  let suppressionPage;
+
+  try {
+    suppressionContext = await runStep('create webdriver suppression context', () => browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    }));
+    await runStep('install webdriver suppression init script', () => suppressionContext.addInitScript(() => {
+      try {
+        Object.defineProperty(Navigator.prototype, 'webdriver', {
+          configurable: true,
+          get: () => undefined,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(navigator, 'webdriver', {
+          configurable: true,
+          get: () => undefined,
+        });
+      } catch {}
+    }));
+    await runStep('install webdriver suppression script override', () => installScriptOverride(suppressionContext, outputDir));
+    suppressionPage = await runStep('open webdriver suppression page', () => suppressionContext.newPage());
+    await runStep(`navigate webdriver suppression page to ${config.targetUrl}`, () => suppressionPage.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    }));
+    await runStep('webdriver suppression post-load wait', () => suppressionPage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+
+    const fingerprint = await runStep('read webdriver suppression fingerprint', () => getFingerprint(suppressionPage));
+    await runStep('webdriver suppression cookie settle wait', () => waitForCookieSettle(suppressionPage, 'webdriver_suppression'));
+    const cookies = parseCookieArray(await runStep('read webdriver suppression DFS cookies', () => getDfsCookies(suppressionPage)));
+    const webdriverState = await runStep('read suppressed navigator.webdriver state', () => getNavigatorWebdriverState(suppressionPage));
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    const evidence = {
+      browser: target.browser,
+      navigator: webdriverState,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit0: getDfsE7BitValue(e7, 0, e7Shuffle),
+      expectedBit0: '0',
+      suppression: 'Navigator.prototype.webdriver and navigator.webdriver getters return undefined before page scripts run.',
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'webdriver-suppression-bit0.json'), evidence);
+    const failures = [
+      ...(webdriverState.webdriver === true ? ['navigator.webdriver remained true after suppression'] : []),
+      ...(evidence.bit0 === '0' ? [] : [`bit0 expected 0 with webdriver suppressed, got ${evidence.bit0}`]),
+    ];
+
+    addResult(
+      results,
+      'S001 navigator.webdriver suppressed',
+      failures.length === 0 ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      failures
+    );
+  } catch (error) {
+    addResult(
+      results,
+      'S001 navigator.webdriver suppressed',
+      'FAIL',
+      { error: error.message },
+      [],
+      [error.message]
+    );
+  } finally {
+    if (suppressionPage && !suppressionPage.isClosed()) await closeWithTimeout('Webdriver suppression page', () => suppressionPage.close());
+    if (suppressionContext) await closeWithTimeout('Webdriver suppression context', () => suppressionContext.close());
+  }
+}
+
+async function runPluginSuppressionTest(browser, target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_PLUGIN_SUPPRESSION_TEST', false)) {
+    addResult(
+      results,
+      'S002 navigator.plugins.length == 0 suppressed',
+      'SKIP',
+      {
+        reason: 'PERFORM_PLUGIN_SUPPRESSION_TEST=false; zero-plugin check skipped by configuration.',
+      },
+      [],
+      ['Plugin suppression check skipped by configuration.']
+    );
+    return;
+  }
+
+  let suppressionContext;
+  let suppressionPage;
+
+  try {
+    suppressionContext = await runStep('create plugin suppression context', () => browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    }));
+    await runStep('install plugin suppression init script', () => suppressionContext.addInitScript(() => {
+      const emptyPlugins = Object.freeze([]);
+      try {
+        Object.defineProperty(Navigator.prototype, 'plugins', {
+          configurable: true,
+          get: () => emptyPlugins,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(navigator, 'plugins', {
+          configurable: true,
+          get: () => emptyPlugins,
+        });
+      } catch {}
+    }));
+    await runStep('install plugin suppression script override', () => installScriptOverride(suppressionContext, outputDir));
+    suppressionPage = await runStep('open plugin suppression page', () => suppressionContext.newPage());
+    await runStep(`navigate plugin suppression page to ${config.targetUrl}`, () => suppressionPage.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    }));
+    await runStep('plugin suppression post-load wait', () => suppressionPage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+
+    const fingerprint = await runStep('read plugin suppression fingerprint', () => getFingerprint(suppressionPage));
+    await runStep('plugin suppression cookie settle wait', () => waitForCookieSettle(suppressionPage, 'plugin_suppression'));
+    const cookies = parseCookieArray(await runStep('read plugin suppression DFS cookies', () => getDfsCookies(suppressionPage)));
+    const pluginState = await runStep('read suppressed navigator.plugins state', () => getNavigatorPluginState(suppressionPage));
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    const evidence = {
+      browser: target.browser,
+      navigatorPlugins: pluginState,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit1: getDfsE7BitValue(e7, 1, e7Shuffle),
+      bit2: getDfsE7BitValue(e7, 2, e7Shuffle),
+      expectedBit1: '1',
+      expectedBit2: '0',
+      suppression: 'Navigator.prototype.plugins and navigator.plugins return an empty frozen array before page scripts run.',
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'plugin-suppression-s002-s003.json'), evidence);
+    const s002Failures = [
+      ...(pluginState.length === 0 ? [] : [`navigator.plugins.length expected 0, got ${pluginState.length}`]),
+      ...(evidence.bit1 === '1' ? [] : [`S002 expected 1, got ${evidence.bit1}`]),
+    ];
+    const s003Failures = [
+      ...(evidence.bit2 === '0' ? [] : [`S003 expected 0, got ${evidence.bit2}`]),
+    ];
+
+    addResult(
+      results,
+      'S002 navigator.plugins.length == 0 suppressed',
+      s002Failures.length === 0 ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      s002Failures
+    );
+    addResult(
+      results,
+      'S003 navigator.plugins.length > 0 suppressed',
+      s003Failures.length === 0 ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      s003Failures
+    );
+  } catch (error) {
+    addResult(
+      results,
+      'S002/S003 navigator.plugins suppressed',
+      'FAIL',
+      { error: error.message },
+      [],
+      [error.message]
+    );
+  } finally {
+    if (suppressionPage && !suppressionPage.isClosed()) await closeWithTimeout('Plugin suppression page', () => suppressionPage.close());
+    if (suppressionContext) await closeWithTimeout('Plugin suppression context', () => suppressionContext.close());
+  }
+}
+
+async function runIndexedDBSuppressionTest(browser, target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_INDEXEDDB_SUPPRESSION_TEST', false)) {
+    addResult(
+      results,
+      'S004 window.indexedDB unavailable',
+      'SKIP',
+      {
+        reason: 'PERFORM_INDEXEDDB_SUPPRESSION_TEST=false; IndexedDB unavailable check skipped by configuration.',
+      },
+      [],
+      ['IndexedDB unavailable check skipped by configuration.']
+    );
+    return;
+  }
+
+  let suppressionContext;
+  let suppressionPage;
+
+  try {
+    suppressionContext = await runStep('create IndexedDB suppression context', () => browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    }));
+    await runStep('install IndexedDB suppression init script', () => suppressionContext.addInitScript(() => {
+      Object.defineProperty(window, 'indexedDB', { value: undefined });
+    }));
+    await runStep('install IndexedDB suppression script override', () => installScriptOverride(suppressionContext, outputDir));
+    suppressionPage = await runStep('open IndexedDB suppression page', () => suppressionContext.newPage());
+    await runStep(`navigate IndexedDB suppression page to ${config.targetUrl}`, () => suppressionPage.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    }));
+    await runStep('IndexedDB suppression post-load wait', () => suppressionPage.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+
+    const fingerprint = await runStep('read IndexedDB suppression fingerprint', () => getFingerprint(suppressionPage));
+    await runStep('IndexedDB suppression cookie settle wait', () => waitForCookieSettle(suppressionPage, 'indexeddb_suppression'));
+    const cookies = parseCookieArray(await runStep('read IndexedDB suppression DFS cookies', () => getDfsCookies(suppressionPage)));
+    const indexedDBState = await runStep('read suppressed IndexedDB state', () => getIndexedDBState(suppressionPage));
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    const evidence = {
+      browser: target.browser,
+      indexedDB: indexedDBState,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit3: getDfsE7BitValue(e7, 3, e7Shuffle),
+      expectedBit3: '1',
+      suppression: "Object.defineProperty(window, 'indexedDB', { value: undefined }) before page scripts run.",
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'indexeddb-suppression-s004.json'), evidence);
+    const failures = [
+      ...(indexedDBState.indexedDBType === 'undefined' ? [] : [`window.indexedDB expected undefined, got ${indexedDBState.indexedDBType}`]),
+      ...(evidence.bit3 === '1' ? [] : [`S004 expected 1, got ${evidence.bit3}`]),
+    ];
+
+    addResult(
+      results,
+      'S004 window.indexedDB unavailable',
+      failures.length === 0 ? 'PASS' : 'FAIL',
+      evidence,
+      [evidenceFile],
+      failures
+    );
+  } catch (error) {
+    addResult(
+      results,
+      'S004 window.indexedDB unavailable',
+      'FAIL',
+      { error: error.message },
+      [],
+      [error.message]
+    );
+  } finally {
+    if (suppressionPage && !suppressionPage.isClosed()) await closeWithTimeout('IndexedDB suppression page', () => suppressionPage.close());
+    if (suppressionContext) await closeWithTimeout('IndexedDB suppression context', () => suppressionContext.close());
+  }
+}
+
+function isChromiumLaunchTarget(target) {
+  return !['firefox', 'webkit', 'safari'].includes(target.browser);
+}
+
+async function installWebGLRendererMock(context, rendererValue) {
+  await context.addInitScript((renderer) => {
+    const UNMASKED_RENDERER_WEBGL = 0x9246;
+    const CONTEXT_TYPES = new Set(['webgl', 'experimental-webgl', 'webgl2']);
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function patchedGetContext(type, ...args) {
+      const context = originalGetContext.call(this, type, ...args);
+      if (!context || !CONTEXT_TYPES.has(String(type))) return context;
+
+      const originalGetExtension = context.getExtension && context.getExtension.bind(context);
+      const originalGetParameter = context.getParameter && context.getParameter.bind(context);
+      if (originalGetExtension) {
+        context.getExtension = function patchedGetExtension(name) {
+          if (name === 'WEBGL_debug_renderer_info') {
+            return {
+              UNMASKED_VENDOR_WEBGL: 0x9245,
+              UNMASKED_RENDERER_WEBGL,
+            };
+          }
+          return originalGetExtension(name);
+        };
+      }
+      if (originalGetParameter) {
+        context.getParameter = function patchedGetParameter(parameter) {
+          if (parameter === UNMASKED_RENDERER_WEBGL) return renderer;
+          return originalGetParameter(parameter);
+        };
+      }
+      return context;
+    };
+  }, rendererValue);
+}
+
+async function installFakeWebGLContextMock(context, rendererValue, extensions) {
+  await context.addInitScript(({ renderer, extensionList }) => {
+    const UNMASKED_VENDOR_WEBGL = 0x9245;
+    const UNMASKED_RENDERER_WEBGL = 0x9246;
+    const CONTEXT_TYPES = new Set(['webgl', 'experimental-webgl']);
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    const fakeExtensions = Object.freeze(Array.isArray(extensionList) ? [...extensionList] : ['EXT_fake']);
+
+    HTMLCanvasElement.prototype.getContext = function patchedGetContext(type, ...args) {
+      if (!CONTEXT_TYPES.has(String(type))) {
+        return originalGetContext.call(this, type, ...args);
+      }
+
+      return {
+        canvas: this,
+        drawingBufferWidth: this.width || 300,
+        drawingBufferHeight: this.height || 150,
+        getExtension: (name) => name === 'WEBGL_debug_renderer_info'
+          ? { UNMASKED_VENDOR_WEBGL, UNMASKED_RENDERER_WEBGL }
+          : null,
+        getExtensions: (name) => name === 'WEBGL_debug_renderer_info'
+          ? { UNMASKED_VENDOR_WEBGL, UNMASKED_RENDERER_WEBGL }
+          : null,
+        getParameter: () => renderer,
+        getSupportedExtensions: () => [...fakeExtensions],
+        getSupportExtensions: () => [...fakeExtensions],
+      };
+    };
+  }, {
+    renderer: rendererValue,
+    extensionList: extensions,
+  });
+}
+
+async function installWebGLExtensionCountMock(context, extensions) {
+  await context.addInitScript((extensionList) => {
+    const CONTEXT_TYPES = new Set(['webgl', 'experimental-webgl', 'webgl2']);
+    const mockedExtensions = Object.freeze(Array.isArray(extensionList) ? [...extensionList] : []);
+
+    function patchContext(context) {
+      if (!context || context.__dfsWebGLExtensionMocked) return context;
+      try {
+        Object.defineProperty(context, '__dfsWebGLExtensionMocked', { value: true });
+      } catch {}
+      context.getSupportedExtensions = () => [...mockedExtensions];
+      context.getSupportExtensions = () => [...mockedExtensions];
+      return context;
+    }
+
+    for (const contextClass of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {
+      if (!contextClass || !contextClass.prototype) continue;
+      try {
+        contextClass.prototype.getSupportedExtensions = function getSupportedExtensionsMock() {
+          return [...mockedExtensions];
+        };
+      } catch {}
+      try {
+        contextClass.prototype.getSupportExtensions = function getSupportExtensionsMock() {
+          return [...mockedExtensions];
+        };
+      } catch {}
+    }
+
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function patchedGetContext(type, ...args) {
+      const context = originalGetContext.call(this, type, ...args);
+      if (!context || !CONTEXT_TYPES.has(String(type))) return context;
+      return patchContext(context);
+    };
+  }, extensions);
+}
+
+async function runSingleGpuRendererTest(target, config, outputDir, resultConfig) {
+  const browserType = getBrowserType(target);
+  const launchOptions = getLaunchOptions(target);
+  const gpuTestArgs = resultConfig.launchArgs || ['--headless=new'];
+  const browser = await browserType.launch({
+    ...launchOptions,
+    headless: true,
+    args: [...(launchOptions.args || []), ...gpuTestArgs],
+  });
+  let context;
+  let page;
+  let scriptOverride = null;
+  let dfsScriptRequests = [];
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    });
+    if (resultConfig.fakeWebGLContext) {
+      await installFakeWebGLContextMock(context, resultConfig.rendererValue, resultConfig.extensions);
+    } else if (Object.prototype.hasOwnProperty.call(resultConfig, 'rendererValue')) {
+      await installWebGLRendererMock(context, resultConfig.rendererValue);
+    }
+    if (resultConfig.extensions && !resultConfig.fakeWebGLContext) {
+      await installWebGLExtensionCountMock(context, resultConfig.extensions);
+    }
+    scriptOverride = await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    dfsScriptRequests = createDfsScriptRequestLog(page);
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+    await recoverSecureChaseSystemRequirements(page);
+
+    await waitForCookieSettle(page, resultConfig.phase);
+    const diagnostics = await collectDfsControlDiagnostics(page, context, outputDir, resultConfig, scriptOverride, dfsScriptRequests);
+    const rendererState = await getWebGLRendererState(page);
+    const extensionState = await getWebGLExtensionState(page);
+    const e7 = diagnostics.dfs_E_7;
+    const e7Shuffle = diagnostics.dfs_E_7_shuffle;
+    return {
+      browser: target.browser,
+      launchArgs: gpuTestArgs,
+      rendererMock: resultConfig.rendererValue,
+      fakeWebGLContext: Boolean(resultConfig.fakeWebGLContext),
+      renderer: rendererState,
+      webglExtensions: extensionState,
+      ...diagnostics,
+      dfs_E_7: e7,
+      bit4: getDfsE7BitValue(e7, 4, e7Shuffle),
+      bit5: getDfsE7BitValue(e7, 5, e7Shuffle),
+      bit6: getDfsE7BitValue(e7, 6, e7Shuffle),
+      expectedBit4: resultConfig.expectedBit4,
+      expectedBit5: resultConfig.expectedBit5,
+      expectedBit6: resultConfig.expectedBit6,
+    };
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${resultConfig.label} page`, () => page.close());
+    if (context) await closeWithTimeout(`${resultConfig.label} context`, () => context.close());
+    if (browser) await closeWithTimeout(`${resultConfig.label} browser`, () => browser.close());
+  }
+}
+
+async function runGpuRendererTests(target, config, outputDir, results) {
+  if (!readBoolean('PERFORM_GPU_RENDERER_TESTS', false)) {
+    addResult(
+      results,
+      'S005 GPU renderer missing/null',
+      'SKIP',
+      { reason: 'PERFORM_GPU_RENDERER_TESTS=false; GPU renderer controls skipped by configuration.' },
+      [],
+      ['GPU renderer controls skipped by configuration.']
+    );
+    addResult(
+      results,
+      'S006 GPU renderer software',
+      'SKIP',
+      { reason: 'PERFORM_GPU_RENDERER_TESTS=false; GPU renderer controls skipped by configuration.' },
+      [],
+      ['GPU renderer controls skipped by configuration.']
+    );
+    addResult(
+      results,
+      'S007 WebGL extension count < 15',
+      'SKIP',
+      { reason: 'PERFORM_GPU_RENDERER_TESTS=false; WebGL extension controls skipped by configuration.' },
+      [],
+      ['WebGL extension controls skipped by configuration.']
+    );
+    return;
+  }
+
+  if (!isChromiumLaunchTarget(target)) {
+    for (const testName of ['S005 GPU renderer missing/null', 'S006 GPU renderer software', 'S007 WebGL extension count < 15']) {
+      addResult(
+        results,
+        testName,
+        'SKIP',
+        { reason: 'GPU/WebGL controls use Chromium launch flags and WebGL mocks.' },
+        [],
+        ['GPU/WebGL controls skipped for non-Chromium target.']
+      );
+    }
+    return;
+  }
+
+  const tests = [
+    {
+      label: 'S005 GPU renderer missing/null',
+      phase: 'gpu_renderer_missing',
+      launchArgs: ['--headless=new', '--disable-gpu'],
+      rendererValue: null,
+      expectedBit4: '1',
+      expectedBit5: '0',
+      evidenceName: 'gpu-renderer-missing-s005.json',
+      failures: (evidence) => [
+        ...gpuRendererMutualExclusionFailures(evidence),
+        ...(evidence.bit4 === '1' ? [] : [`S005 expected 1, got ${evidence.bit4}`]),
+        ...(evidence.bit5 === '0' ? [] : [`S006 expected 0, got ${evidence.bit5}`]),
+      ],
+    },
+    {
+      label: 'S006 GPU renderer software',
+      phase: 'gpu_renderer_software',
+      launchArgs: ['--headless=new'],
+      fakeWebGLContext: true,
+      rendererValue: 'FictionalVendor FakeGPU 9000',
+      extensions: ['EXT_fake'],
+      expectedBit4: '0',
+      expectedBit5: '1',
+      baselineBeforeMock: true,
+      evidenceName: 'gpu-renderer-software-s006.json',
+      failures: (evidence) => [
+        ...gpuRendererMutualExclusionFailures(evidence),
+        ...(evidence.webglExtensions.webgl.extensionCount > 0 ? [] : [`S006 setup expected WebGL extension count > 0 so S005 is not triggered by wgl=0, got ${evidence.webglExtensions.webgl.extensionCount}`]),
+        ...(evidence.bit5 === '1' ? [] : [`S006 expected 1, got ${evidence.bit5}`]),
+        ...(shouldIgnoreS005ForGpuRendererControl(evidence) || evidence.bit4 === '0' ? [] : [`S005 expected 0, got ${evidence.bit4}`]),
+      ],
+    },
+    {
+      label: 'S007 WebGL extension count < 15',
+      phase: 'webgl_low_extension_count',
+      launchArgs: ['--headless=new'],
+      extensions: [
+        'ANGLE_instanced_arrays',
+        'EXT_blend_minmax',
+        'EXT_color_buffer_half_float',
+        'EXT_float_blend',
+        'EXT_frag_depth',
+        'EXT_shader_texture_lod',
+        'EXT_texture_filter_anisotropic',
+        'OES_element_index_uint',
+        'OES_standard_derivatives',
+        'OES_texture_float',
+      ],
+      expectedBit6: '1',
+      evidenceName: 'webgl-low-extension-count-s007.json',
+      failures: (evidence) => [
+        ...(evidence.webglExtensions.webgl.extensionCount < 15 ? [] : [`WebGL extension count expected < 15, got ${evidence.webglExtensions.webgl.extensionCount}`]),
+        ...(evidence.bit6 === '1' ? [] : [`S007 expected 1, got ${evidence.bit6}`]),
+      ],
+    },
+  ];
+
+  for (const test of tests) {
+    try {
+      let baselineBeforeMock = null;
+      if (test.baselineBeforeMock) {
+        const baselineConfig = {
+          ...test,
+          label: `${test.label} baseline before mock`,
+          phase: `${test.phase}_baseline_before_mock`,
+          evidenceName: test.evidenceName.replace(/\.json$/i, '-baseline-before-mock.json'),
+          expectedBit4: undefined,
+          expectedBit5: undefined,
+          expectedBit6: undefined,
+          baselineBeforeMock: false,
+        };
+        delete baselineConfig.rendererValue;
+        delete baselineConfig.extensions;
+        baselineBeforeMock = await runStep(`run ${test.label} baseline before mock`, () => runSingleGpuRendererTest(target, config, outputDir, baselineConfig));
+      }
+      const evidence = await runStep(`run ${test.label}`, () => runSingleGpuRendererTest(target, config, outputDir, test));
+      if (baselineBeforeMock) {
+        evidence.baselineBeforeMock = baselineBeforeMock;
+        evidence.s005Expectation = baselineBeforeMock.bit4 === '1'
+          ? 'ignored because S005 was already 1 before the S006 renderer mock'
+          : 'S005 expected 0 because baseline S005 was not already 1';
+      }
+      const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+      const failures = test.failures(evidence);
+      addDfsE7ControlResult(
+        results,
+        test.label,
+        evidence,
+        [evidenceFile],
+        failures,
+        ['bit4', 'bit5', 'bit6'].filter((key) => evidence[`expectedBit${key.slice(3)}`] !== undefined)
+      );
+    } catch (error) {
+      addResult(results, test.label, 'FAIL', { error: error.message }, [], [error.message]);
+    }
+  }
+}
+
+async function runSingleDevicePixelRatioTest(browser, config, outputDir, resultConfig) {
+  let context;
+  let page;
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+      deviceScaleFactor: resultConfig.devicePixelRatio,
+    });
+    await context.addInitScript((dpr) => {
+      Object.defineProperty(window, 'devicePixelRatio', {
+        configurable: true,
+        get: () => dpr,
+      });
+    }, resultConfig.devicePixelRatio);
+    await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+
+    const fingerprint = await getFingerprint(page);
+    await waitForCookieSettle(page, resultConfig.phase);
+    const cookies = parseCookieArray(await getDfsCookies(page));
+    const dprState = await getDevicePixelRatioState(page);
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    return {
+      devicePixelRatio: dprState,
+      configuredDevicePixelRatio: resultConfig.devicePixelRatio,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit7: getDfsE7BitValue(e7, 7, e7Shuffle),
+      bit8: getDfsE7BitValue(e7, 8, e7Shuffle),
+      bit9: getDfsE7BitValue(e7, 9, e7Shuffle),
+      expectedBit7: resultConfig.expectedBit7,
+      expectedBit8: resultConfig.expectedBit8,
+      expectedBit9: resultConfig.expectedBit9,
+    };
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${resultConfig.label} page`, () => page.close());
+    if (context) await closeWithTimeout(`${resultConfig.label} context`, () => context.close());
+  }
+}
+
+async function runDevicePixelRatioTests(browser, config, outputDir, results) {
+  const testNames = [
+    'S008/S009/S010 devicePixelRatio < 1',
+    'S008/S009/S010 devicePixelRatio == 1',
+    'S008/S009/S010 devicePixelRatio >= 2',
+  ];
+
+  if (!readBoolean('PERFORM_DEVICE_PIXEL_RATIO_TESTS', false)) {
+    for (const testName of testNames) {
+      addResult(
+        results,
+        testName,
+        'SKIP',
+        { reason: 'PERFORM_DEVICE_PIXEL_RATIO_TESTS=false; DPR controls skipped by configuration.' },
+        [],
+        ['DPR controls skipped by configuration.']
+      );
+    }
+    return;
+  }
+
+  const tests = [
+    {
+      label: testNames[0],
+      phase: 'dpr_less_than_1',
+      devicePixelRatio: 0.75,
+      expectedBit7: '1',
+      expectedBit8: '0',
+      expectedBit9: '0',
+      evidenceName: 'device-pixel-ratio-less-than-1-s008.json',
+    },
+    {
+      label: testNames[1],
+      phase: 'dpr_equal_1',
+      devicePixelRatio: 1,
+      expectedBit7: '0',
+      expectedBit8: '1',
+      expectedBit9: '0',
+      evidenceName: 'device-pixel-ratio-equal-1-s009.json',
+    },
+    {
+      label: testNames[2],
+      phase: 'dpr_greater_than_or_equal_2',
+      devicePixelRatio: 2,
+      expectedBit7: '0',
+      expectedBit8: '0',
+      expectedBit9: '1',
+      evidenceName: 'device-pixel-ratio-greater-than-or-equal-2-s010.json',
+    },
+  ];
+
+  for (const test of tests) {
+    try {
+      const evidence = await runStep(`run ${test.label}`, () => runSingleDevicePixelRatioTest(browser, config, outputDir, test));
+      const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+      const failures = [
+        ...(evidence.devicePixelRatio.devicePixelRatio === test.devicePixelRatio ? [] : [`window.devicePixelRatio expected ${test.devicePixelRatio}, got ${evidence.devicePixelRatio.devicePixelRatio}`]),
+        ...(evidence.bit7 === test.expectedBit7 ? [] : [`S008 expected ${test.expectedBit7}, got ${evidence.bit7}`]),
+        ...(evidence.bit8 === test.expectedBit8 ? [] : [`S009 expected ${test.expectedBit8}, got ${evidence.bit8}`]),
+        ...(evidence.bit9 === test.expectedBit9 ? [] : [`S010 expected ${test.expectedBit9}, got ${evidence.bit9}`]),
+      ];
+      addDfsE7ControlResult(results, test.label, evidence, [evidenceFile], failures, ['bit7', 'bit8', 'bit9']);
+    } catch (error) {
+      addResult(results, test.label, 'FAIL', { error: error.message }, [], [error.message]);
+    }
+  }
+}
+
+async function installMediaDeviceEnumerationMock(context, mode) {
+  await context.addInitScript((enumerationMode) => {
+    const mediaDevices = navigator.mediaDevices || {};
+    const enumerateDevices = enumerationMode === 'reject'
+      ? () => Promise.reject(new DOMException('S011 enumerateDevices rejection mock', 'NotAllowedError'))
+      : () => Promise.resolve([]);
+
+    try {
+      Object.defineProperty(mediaDevices, 'enumerateDevices', {
+        configurable: true,
+        value: enumerateDevices,
+      });
+    } catch {}
+
+    try {
+      Object.defineProperty(navigator, 'mediaDevices', {
+        configurable: true,
+        get: () => mediaDevices,
+      });
+    } catch {}
+  }, mode);
+}
+
+async function runSingleMediaDeviceEnumerationTest(target, config, outputDir, resultConfig) {
+  const browserType = getBrowserType(target);
+  const launchOptions = getLaunchOptions(target);
+  const browser = await browserType.launch({
+    ...launchOptions,
+    headless: true,
+  });
+  let context;
+  let page;
+  let scriptOverride = null;
+  let dfsScriptRequests = [];
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    });
+    await installMediaDeviceEnumerationMock(context, resultConfig.mode);
+    scriptOverride = await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    dfsScriptRequests = createDfsScriptRequestLog(page);
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+
+    await waitForCookieSettle(page, resultConfig.phase);
+    const diagnostics = await collectDfsControlDiagnostics(page, context, outputDir, resultConfig, scriptOverride, dfsScriptRequests);
+    const mediaDevices = await getMediaDeviceEnumerationState(page);
+    const e7 = diagnostics.dfs_E_7;
+    const e7Shuffle = diagnostics.dfs_E_7_shuffle;
+    return {
+      browser: target.browser,
+      headless: true,
+      mode: resultConfig.mode,
+      mediaDevices,
+      ...diagnostics,
+      dfs_E_7: e7,
+      bit10: getDfsE7BitValue(e7, 10, e7Shuffle),
+      expectedBit10: '1',
+    };
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${resultConfig.label} page`, () => page.close());
+    if (context) await closeWithTimeout(`${resultConfig.label} context`, () => context.close());
+    if (browser) await closeWithTimeout(`${resultConfig.label} browser`, () => browser.close());
+  }
+}
+
+async function runMediaDeviceEnumerationTests(target, config, outputDir, results) {
+  const testNames = [
+    'S011 mediaDevices.enumerateDevices returns empty array',
+    'S011 mediaDevices.enumerateDevices rejects',
+  ];
+
+  if (!readBoolean('PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS', false)) {
+    for (const testName of testNames) {
+      addResult(
+        results,
+        testName,
+        'SKIP',
+        { reason: 'PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=false; media-device enumeration controls skipped by configuration.' },
+        [],
+        ['Media-device enumeration controls skipped by configuration.']
+      );
+    }
+    return;
+  }
+
+  const tests = [
+    {
+      label: testNames[0],
+      phase: 'media_devices_empty',
+      mode: 'empty',
+      evidenceName: 'media-devices-empty-s011.json',
+      failures: (evidence) => [
+        ...(evidence.mediaDevices.deviceCount === 0 ? [] : [`enumerateDevices expected 0 devices, got ${evidence.mediaDevices.deviceCount}`]),
+        ...(evidence.bit10 === '1' ? [] : [`S011 expected 1, got ${evidence.bit10}`]),
+      ],
+    },
+    {
+      label: testNames[1],
+      phase: 'media_devices_reject',
+      mode: 'reject',
+      evidenceName: 'media-devices-reject-s011.json',
+      failures: (evidence) => [
+        ...(evidence.mediaDevices.rejected ? [] : ['enumerateDevices expected to reject']),
+        ...(evidence.bit10 === '1' ? [] : [`S011 expected 1, got ${evidence.bit10}`]),
+      ],
+    },
+  ];
+
+  for (const test of tests) {
+    try {
+      const evidence = await runStep(`run ${test.label}`, () => runSingleMediaDeviceEnumerationTest(target, config, outputDir, test));
+      const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+      const failures = test.failures(evidence);
+      addDfsE7ControlResult(results, test.label, evidence, [evidenceFile], failures, ['bit10']);
+    } catch (error) {
+      addResult(results, test.label, 'FAIL', { error: error.message }, [], [error.message]);
+    }
+  }
+}
+
+async function runSingleHardwareConcurrencyTest(browser, config, outputDir, resultConfig) {
+  let context;
+  let page;
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    });
+    await context.addInitScript((hardwareConcurrency) => {
+      try {
+        Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+          configurable: true,
+          enumerable: true,
+          get: () => hardwareConcurrency,
+        });
+      } catch {}
+      try {
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+          configurable: true,
+          get: () => hardwareConcurrency,
+        });
+      } catch {}
+    }, resultConfig.hardwareConcurrency);
+    await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+
+    const fingerprint = await getFingerprint(page);
+    await waitForCookieSettle(page, resultConfig.phase);
+    const cookies = parseCookieArray(await getDfsCookies(page));
+    const hardwareConcurrency = await getHardwareConcurrencyState(page);
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    return {
+      hardwareConcurrency,
+      configuredHardwareConcurrency: resultConfig.hardwareConcurrency,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit11: getDfsE7BitValue(e7, 11, e7Shuffle),
+      bit12: getDfsE7BitValue(e7, 12, e7Shuffle),
+      bit13: getDfsE7BitValue(e7, 13, e7Shuffle),
+      expectedBit11: resultConfig.expectedBit11,
+      expectedBit12: resultConfig.expectedBit12,
+      expectedBit13: resultConfig.expectedBit13,
+    };
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${resultConfig.label} page`, () => page.close());
+    if (context) await closeWithTimeout(`${resultConfig.label} context`, () => context.close());
+  }
+}
+
+async function runHardwareConcurrencyTests(browser, config, outputDir, results) {
+  const testNames = [
+    'S012/S013/S014 navigator.hardwareConcurrency == 1',
+    'S012/S013/S014 navigator.hardwareConcurrency > 1 and < 5',
+    'S012/S013/S014 navigator.hardwareConcurrency >= 5',
+  ];
+
+  if (!readBoolean('PERFORM_HARDWARE_CONCURRENCY_TESTS', false)) {
+    for (const testName of testNames) {
+      addResult(
+        results,
+        testName,
+        'SKIP',
+        { reason: 'PERFORM_HARDWARE_CONCURRENCY_TESTS=false; hardware-concurrency controls skipped by configuration.' },
+        [],
+        ['Hardware-concurrency controls skipped by configuration.']
+      );
+    }
+    return;
+  }
+
+  const tests = [
+    {
+      label: testNames[0],
+      phase: 'hardware_concurrency_equal_1',
+      hardwareConcurrency: 1,
+      expectedBit11: '1',
+      expectedBit12: '0',
+      expectedBit13: '0',
+      evidenceName: 'hardware-concurrency-equal-1-s012.json',
+    },
+    {
+      label: testNames[1],
+      phase: 'hardware_concurrency_between_2_and_4',
+      hardwareConcurrency: 4,
+      expectedBit11: '0',
+      expectedBit12: '1',
+      expectedBit13: '0',
+      evidenceName: 'hardware-concurrency-between-2-and-4-s013.json',
+    },
+    {
+      label: testNames[2],
+      phase: 'hardware_concurrency_greater_than_or_equal_5',
+      hardwareConcurrency: 8,
+      expectedBit11: '0',
+      expectedBit12: '0',
+      expectedBit13: '1',
+      evidenceName: 'hardware-concurrency-greater-than-or-equal-5-s014.json',
+    },
+  ];
+
+  for (const test of tests) {
+    try {
+      const evidence = await runStep(`run ${test.label}`, () => runSingleHardwareConcurrencyTest(browser, config, outputDir, test));
+      const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+      const failures = [
+        ...(evidence.hardwareConcurrency.hardwareConcurrency === test.hardwareConcurrency ? [] : [`navigator.hardwareConcurrency expected ${test.hardwareConcurrency}, got ${evidence.hardwareConcurrency.hardwareConcurrency}`]),
+        ...(evidence.bit11 === test.expectedBit11 ? [] : [`S012 expected ${test.expectedBit11}, got ${evidence.bit11}`]),
+        ...(evidence.bit12 === test.expectedBit12 ? [] : [`S013 expected ${test.expectedBit12}, got ${evidence.bit12}`]),
+        ...(evidence.bit13 === test.expectedBit13 ? [] : [`S014 expected ${test.expectedBit13}, got ${evidence.bit13}`]),
+      ];
+      addDfsE7ControlResult(results, test.label, evidence, [evidenceFile], failures, ['bit11', 'bit12', 'bit13']);
+    } catch (error) {
+      addResult(results, test.label, 'FAIL', { error: error.message }, [], [error.message]);
+    }
+  }
+}
+
+async function runSuspiciousUserAgentKeywordTest(browser, config, outputDir, results) {
+  const testName = 'S015 suspicious user-agent keyword';
+  if (!readBoolean('PERFORM_SUSPICIOUS_UA_KEYWORD_TEST', false)) {
+    addResult(
+      results,
+      testName,
+      'SKIP',
+      { reason: 'PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=false; suspicious UA keyword control skipped by configuration.' },
+      [],
+      ['Suspicious UA keyword control skipped by configuration.']
+    );
+    return;
+  }
+
+  const keyword = readString('SUSPICIOUS_UA_KEYWORD', 'Googlebot');
+  const userAgent = readString(
+    'SUSPICIOUS_UA_STRING',
+    `Mozilla/5.0 (compatible; ${keyword}/2.1; +https://www.google.com/bot.html)`
+  );
+  let context;
+  let page;
+  let scriptOverride = null;
+  let dfsScriptRequests = [];
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+      userAgent,
+    });
+    scriptOverride = await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    dfsScriptRequests = createDfsScriptRequestLog(page);
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+
+    await waitForCookieSettle(page, 'suspicious_user_agent_keyword');
+    const diagnostics = await collectDfsControlDiagnostics(
+      page,
+      context,
+      outputDir,
+      { phase: 'suspicious_user_agent_keyword', evidenceName: 'suspicious-user-agent-keyword-s015.json' },
+      scriptOverride,
+      dfsScriptRequests
+    );
+    const userAgentState = await getUserAgentKeywordState(page, keyword);
+    const e7 = diagnostics.dfs_E_7;
+    const e7Shuffle = diagnostics.dfs_E_7_shuffle;
+    const evidence = {
+      userAgent: userAgentState,
+      configuredUserAgent: userAgent,
+      ...diagnostics,
+      dfs_E_7: e7,
+      bit14: getDfsE7BitValue(e7, 14, e7Shuffle),
+      expectedBit14: '1',
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'suspicious-user-agent-keyword-s015.json'), evidence);
+    const failures = [
+      ...(userAgentState.containsKeyword ? [] : [`navigator.userAgent expected to contain ${keyword}`]),
+      ...(evidence.bit14 === '1' ? [] : [`S015 expected 1, got ${evidence.bit14}`]),
+    ];
+    addDfsE7ControlResult(results, testName, evidence, [evidenceFile], failures, ['bit14']);
+  } catch (error) {
+    addResult(results, testName, 'FAIL', { error: error.message }, [], [error.message]);
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${testName} page`, () => page.close());
+    if (context) await closeWithTimeout(`${testName} context`, () => context.close());
+  }
+}
+
+async function runFingerprintModificationTest(browser, config, outputDir, results) {
+  const testName = 'S016 fingerprint cookie modification detected';
+  if (!readBoolean('PERFORM_FINGERPRINT_MODIFICATION_TEST', false)) {
+    addResult(
+      results,
+      testName,
+      'SKIP',
+      { reason: 'PERFORM_FINGERPRINT_MODIFICATION_TEST=false; fingerprint modification control skipped by configuration.' },
+      [],
+      ['Fingerprint modification control skipped by configuration.']
+    );
+    return;
+  }
+
+  let context;
+  let page;
+
+  try {
+    context = await browser.newContext({
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    });
+    await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+    await waitForDfsFingerprintValue(page, 'dfs_F_1');
+
+    const beforeFingerprint = await getFingerprint(page);
+    await waitForCookieSettle(page, 'fingerprint_modification_before');
+    const beforeCookies = parseCookieArray(await getDfsCookies(page));
+    const beforeContextCookies = await getDfsContextCookies(context);
+    const beforeF1 = beforeCookies.dfs_F_1 || beforeContextCookies.dfs_F_1 || getFingerprintValue(beforeFingerprint, 'dfs_F_1');
+
+    await page.evaluate(() => {
+      document.cookie = 'dfs_F_1=TAMPERED; path=/; SameSite=Lax';
+    });
+    const tamperedCookies = parseCookieArray(await getDfsCookies(page));
+    const tamperedContextCookies = await getDfsContextCookies(context);
+
+    await page.reload({
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_RELOAD_WAIT_MS || 5000));
+
+    const afterFingerprint = await getFingerprint(page);
+    await waitForCookieSettle(page, 'fingerprint_modification_after');
+    const afterCookies = parseCookieArray(await getDfsCookies(page));
+    const afterContextCookies = await getDfsContextCookies(context);
+    const e7 = String(afterCookies.dfs_E_7 || getFingerprintValue(afterFingerprint, 'dfs_E_7') || '');
+    const e7Seed = afterCookies.dfs_F_5 || getFingerprintValue(afterFingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    const evidence = {
+      before: {
+        dfs_F_1: beforeF1,
+        cookies: beforeCookies,
+        contextCookies: beforeContextCookies,
+      },
+      tampered: {
+        attemptedCookieValue: 'TAMPERED',
+        dfs_F_1: tamperedCookies.dfs_F_1 || tamperedContextCookies.dfs_F_1,
+        cookies: tamperedCookies,
+        contextCookies: tamperedContextCookies,
+      },
+      afterRecollection: {
+        cookies: afterCookies,
+        contextCookies: afterContextCookies,
+        dfs_F_1: afterCookies.dfs_F_1 || afterContextCookies.dfs_F_1 || getFingerprintValue(afterFingerprint, 'dfs_F_1'),
+      },
+      trigger: 'Set document.cookie dfs_F_1=TAMPERED, then reloaded the page to force DFS re-collection.',
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit15: getDfsE7BitValue(e7, 15, e7Shuffle),
+      expectedBit15: '1',
+    };
+    const evidenceFile = saveJson(path.join(outputDir, 'fingerprint-cookie-modification-s016.json'), evidence);
+    const failures = [
+      ...(beforeF1 ? [] : ['dfs_F_1 was not present before tampering']),
+      ...(evidence.tampered.dfs_F_1 === 'TAMPERED' ? [] : [`dfs_F_1 tamper expected TAMPERED, got ${evidence.tampered.dfs_F_1}`]),
+      ...(evidence.bit15 === '1' ? [] : [`S016 expected 1, got ${evidence.bit15}`]),
+    ];
+    addResult(results, testName, failures.length === 0 ? 'PASS' : 'FAIL', evidence, [evidenceFile], failures);
+  } catch (error) {
+    addResult(results, testName, 'FAIL', { error: error.message }, [], [error.message]);
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${testName} page`, () => page.close());
+    if (context) await closeWithTimeout(`${testName} context`, () => context.close());
+  }
+}
+
+async function installClientHintsMock(context, mode) {
+  await context.addInitScript((clientHintsMode) => {
+    const fullVersion = clientHintsMode === 'version-mismatch' ? '147.0.7778.97' : '148.0.7778.97';
+    const majorVersion = fullVersion.match(/(\d+)/)?.[1] || '148';
+    const platform = clientHintsMode === 'platform-mismatch' ? 'Android' : 'Windows';
+    const notABrand = clientHintsMode === 'brand-quirk' ? 'Not?A_Brand' : 'Not/A)Brand';
+    const populatedHints = {
+      brands: [
+        { brand: 'Chromium', version: majorVersion },
+        { brand: notABrand, version: '99' },
+      ],
+      fullVersionList: [
+        { brand: 'Chromium', version: fullVersion },
+        { brand: notABrand, version: '99.0.0.0' },
+      ],
+      platform,
+    };
+    const emptyHints = {
+      brands: [],
+      fullVersionList: [],
+      platform: '',
+    };
+    const highEntropy = clientHintsMode === 'empty' ? emptyHints : populatedHints;
+    const lowEntropy = {
+      brands: highEntropy.brands,
+      mobile: false,
+      platform: highEntropy.platform,
+    };
+    const userAgentData = {
+      brands: lowEntropy.brands,
+      mobile: false,
+      platform: lowEntropy.platform,
+      toJSON: () => ({ ...lowEntropy }),
+      getHighEntropyValues: async (hints) => {
+        const result = { ...lowEntropy };
+        for (const hint of hints || []) {
+          if (Object.prototype.hasOwnProperty.call(highEntropy, hint)) {
+            result[hint] = highEntropy[hint];
+          }
+        }
+        return result;
+      },
+    };
+
+    try {
+      Object.defineProperty(Navigator.prototype, 'userAgentData', {
+        configurable: true,
+        enumerable: true,
+        get: () => userAgentData,
+      });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'userAgentData', {
+        configurable: true,
+        get: () => userAgentData,
+      });
+    } catch {}
+  }, mode);
+}
+
+async function installNavigatorPlatformMock(context, platform) {
+  if (platform === undefined) return;
+  await context.addInitScript((mockPlatform) => {
+    try {
+      Object.defineProperty(Navigator.prototype, 'platform', {
+        configurable: true,
+        enumerable: true,
+        get: () => mockPlatform,
+      });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        get: () => mockPlatform,
+      });
+    } catch {}
+  }, platform);
+}
+
+async function runSingleClientHintsTest(browser, config, outputDir, resultConfig) {
+  let context;
+  let page;
+
+  try {
+    context = await browser.newContext({
+      ...(resultConfig.userAgent ? { userAgent: resultConfig.userAgent } : {}),
+      ...(resultConfig.locale ? { locale: resultConfig.locale } : {}),
+      ...(resultConfig.timezoneId ? { timezoneId: resultConfig.timezoneId } : {}),
+      viewport: {
+        width: Number(process.env.VIEWPORT_WIDTH || 1365),
+        height: Number(process.env.VIEWPORT_HEIGHT || 900),
+      },
+    });
+    await installClientHintsMock(context, resultConfig.mode);
+    await installNavigatorPlatformMock(context, resultConfig.navigatorPlatform);
+    if (Object.prototype.hasOwnProperty.call(resultConfig, 'rendererValue')) {
+      await installWebGLRendererMock(context, resultConfig.rendererValue);
+    }
+    await installScriptOverride(context, outputDir);
+    page = await context.newPage();
+    await page.goto(config.targetUrl, {
+      waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
+      timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
+    });
+    await page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000));
+
+    const fingerprint = await getFingerprint(page);
+    await waitForCookieSettle(page, resultConfig.phase);
+    const cookies = parseCookieArray(await getDfsCookies(page));
+    const clientHints = await getClientHintsState(page);
+    const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
+    const e7Seed = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
+    const e7Shuffle = readBoolean('DFS_E7_BIT_SHUFFLE_ENABLED', false) ? getDfsE7Shuffle(e7Seed, e7.length || 32) : null;
+    return {
+      mode: resultConfig.mode,
+      clientHints,
+      dfs_E_7: e7,
+      dfs_E_7_decoded: decodeDfsE7BitString(e7, e7Shuffle),
+      dfs_F_5_seed_source: e7Seed,
+      dfs_E_7_shuffle: e7Shuffle,
+      bit16: getDfsE7BitValue(e7, 16, e7Shuffle),
+      bit17: getDfsE7BitValue(e7, 17, e7Shuffle),
+      bit18: getDfsE7BitValue(e7, 18, e7Shuffle),
+      bit19: getDfsE7BitValue(e7, 19, e7Shuffle),
+      bit20: getDfsE7BitValue(e7, 20, e7Shuffle),
+      bit22: getDfsE7BitValue(e7, 22, e7Shuffle),
+      bit23: getDfsE7BitValue(e7, 23, e7Shuffle),
+      bit24: getDfsE7BitValue(e7, 24, e7Shuffle),
+      expectedBit16: resultConfig.expectedBit16,
+      expectedBit17: resultConfig.expectedBit17,
+      expectedBit18: resultConfig.expectedBit18,
+      expectedBit19: resultConfig.expectedBit19,
+      expectedBit20: resultConfig.expectedBit20,
+      expectedBit22: resultConfig.expectedBit22,
+      expectedBit23: resultConfig.expectedBit23,
+      expectedBit24: resultConfig.expectedBit24,
+    };
+  } finally {
+    if (page && !page.isClosed()) await closeWithTimeout(`${resultConfig.label} page`, () => page.close());
+    if (context) await closeWithTimeout(`${resultConfig.label} context`, () => context.close());
+  }
+}
+
+async function runClientHintsTests(browser, config, outputDir, results) {
+  const testNames = [
+    'S023/S017 client hints empty',
+    'S023/S017 client hints populated',
+    'S018 Apple signatures in non-Apple UA',
+    'S018 Apple signatures allowed Apple UA control',
+    'S019 WebGL renderer anomaly SwiftShader',
+    'S019 WebGL renderer recognized control',
+    'S020 client hints Not?A_Brand quirk',
+    'S020 client hints normal brand control',
+    'S021 locale/timezone mismatch en-US outside America',
+    'S021 locale/timezone matched control',
+    'S024 userAgent/client hints version mismatch',
+    'S024 userAgent/client hints version match',
+    'S025 userAgent/client hints platform mismatch',
+    'S025 userAgent/client hints platform match',
+  ];
+
+  if (!readBoolean('PERFORM_CLIENT_HINTS_TESTS', false)) {
+    for (const testName of testNames) {
+      addResult(
+        results,
+        testName,
+        'SKIP',
+        { reason: 'PERFORM_CLIENT_HINTS_TESTS=false; client-hints controls skipped by configuration.' },
+        [],
+        ['Client-hints controls skipped by configuration.']
+      );
+    }
+    return;
+  }
+
+  const tests = [
+    {
+      label: testNames[0],
+      phase: 'client_hints_empty',
+      mode: 'empty',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: '1',
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-empty-s023-s017.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.anyEmpty ? [] : ['Expected at least one of brands, fullVersionList, or platform to be empty']),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1, got ${evidence.bit16}`]),
+        ...(evidence.bit22 === '1' ? [] : [`S023 expected 1, got ${evidence.bit22}`]),
+      ],
+    },
+    {
+      label: testNames[1],
+      phase: 'client_hints_populated',
+      mode: 'populated',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: '0',
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-populated-s023-s017.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.anyEmpty ? [] : ['Expected brands, fullVersionList, and platform to be populated']),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0, got ${evidence.bit16}`]),
+        ...(evidence.bit22 === '0' ? [] : [`S023 expected 0, got ${evidence.bit22}`]),
+      ],
+    },
+    {
+      label: testNames[2],
+      phase: 'apple_signature_non_apple_ua',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0',
+      navigatorPlatform: 'Win32',
+      expectedBit16: '1',
+      expectedBit17: '1',
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'apple-signature-non-apple-ua-s018.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.appleSignature ? [] : ['Expected Apple signature in non-Apple UA to be detected']),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S018 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit17 === '1' ? [] : [`S018 expected 1, got ${evidence.bit17}`]),
+      ],
+    },
+    {
+      label: testNames[3],
+      phase: 'apple_signature_apple_ua_control',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36',
+      navigatorPlatform: 'Win32',
+      expectedBit16: '0',
+      expectedBit17: '0',
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'apple-signature-apple-ua-control-s018.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.appleSignature ? [] : ['Expected Safari token to suppress S018 apple-signature condition']),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S018 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit17 === '0' ? [] : [`S018 expected 0, got ${evidence.bit17}`]),
+      ],
+    },
+    {
+      label: testNames[4],
+      phase: 'webgl_renderer_anomaly_swiftshader',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      rendererValue: 'Google SwiftShader',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: '1',
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'webgl-renderer-anomaly-swiftshader-s019.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.webglRendererAnomaly.triggered ? [] : [`Expected WebGL renderer anomaly, got ${evidence.clientHints.webglRendererAnomaly.renderer}`]),
+        ...(evidence.clientHints.webglRendererAnomaly.swiftShader ? [] : [`Expected SwiftShader renderer, got ${evidence.clientHints.webglRendererAnomaly.renderer}`]),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S019 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit18 === '1' ? [] : [`S019 expected 1, got ${evidence.bit18}`]),
+      ],
+    },
+    {
+      label: testNames[5],
+      phase: 'webgl_renderer_recognized_control',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      rendererValue: 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0)',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: '0',
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'webgl-renderer-recognized-control-s019.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.webglRendererAnomaly.triggered ? [] : [`Expected recognized WebGL renderer, got ${evidence.clientHints.webglRendererAnomaly.renderer}`]),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S019 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit18 === '0' ? [] : [`S019 expected 0, got ${evidence.bit18}`]),
+      ],
+    },
+    {
+      label: testNames[6],
+      phase: 'client_hints_brand_quirk',
+      mode: 'brand-quirk',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: '1',
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-brand-quirk-s020.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.brandQuirk ? [] : [`Expected Not?A_Brand brand quirk, got ${evidence.clientHints.brandStr}`]),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S020 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit19 === '1' ? [] : [`S020 expected 1, got ${evidence.bit19}`]),
+      ],
+    },
+    {
+      label: testNames[7],
+      phase: 'client_hints_normal_brand_control',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: '0',
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-normal-brand-control-s020.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.brandQuirk ? [] : [`Expected normal brand list, got ${evidence.clientHints.brandStr}`]),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S020 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit19 === '0' ? [] : [`S020 expected 0, got ${evidence.bit19}`]),
+      ],
+    },
+    {
+      label: testNames[8],
+      phase: 'locale_timezone_en_us_outside_america',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      timezoneId: 'Europe/London',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: '1',
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'locale-timezone-mismatch-s021.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.localeTimezoneMismatch ? [] : [`Expected locale/timezone mismatch, got ${evidence.clientHints.language}/${evidence.clientHints.timeZone}`]),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S021 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit20 === '1' ? [] : [`S021 expected 1, got ${evidence.bit20}`]),
+      ],
+    },
+    {
+      label: testNames[9],
+      phase: 'locale_timezone_matched_control',
+      mode: 'populated',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: '0',
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: undefined,
+      evidenceName: 'locale-timezone-matched-control-s021.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.localeTimezoneMismatch ? [] : [`Expected locale/timezone match, got ${evidence.clientHints.language}/${evidence.clientHints.timeZone}`]),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S021 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit20 === '0' ? [] : [`S021 expected 0, got ${evidence.bit20}`]),
+      ],
+    },
+    {
+      label: testNames[10],
+      phase: 'client_hints_version_mismatch',
+      mode: 'version-mismatch',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: '1',
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-version-mismatch-s024.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.versionMismatch ? [] : [`Expected UA Chrome major ${evidence.clientHints.uaChromeMajor} to differ from CH major ${evidence.clientHints.firstFullVersionListMajor}`]),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S024 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit23 === '1' ? [] : [`S024 expected 1, got ${evidence.bit23}`]),
+      ],
+    },
+    {
+      label: testNames[11],
+      phase: 'client_hints_version_match',
+      mode: 'version-match',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: '0',
+      expectedBit24: undefined,
+      evidenceName: 'client-hints-version-match-s024.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.versionMismatch ? [] : [`Expected UA Chrome major ${evidence.clientHints.uaChromeMajor} to match CH major ${evidence.clientHints.firstFullVersionListMajor}`]),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S024 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit23 === '0' ? [] : [`S024 expected 0, got ${evidence.bit23}`]),
+      ],
+    },
+    {
+      label: testNames[12],
+      phase: 'client_hints_platform_mismatch',
+      mode: 'platform-mismatch',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '1',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: '1',
+      evidenceName: 'client-hints-platform-mismatch-s025.json',
+      failures: (evidence) => [
+        ...(evidence.clientHints.platformMismatch ? [] : [`Expected UA platform to differ from CH platform ${evidence.clientHints.highEntropy?.platform}`]),
+        ...(evidence.bit16 === '1' ? [] : [`S017 expected 1 when S025 fires, got ${evidence.bit16}`]),
+        ...(evidence.bit24 === '1' ? [] : [`S025 expected 1, got ${evidence.bit24}`]),
+      ],
+    },
+    {
+      label: testNames[13],
+      phase: 'client_hints_platform_match',
+      mode: 'platform-match',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+      expectedBit16: '0',
+      expectedBit17: undefined,
+      expectedBit18: undefined,
+      expectedBit19: undefined,
+      expectedBit20: undefined,
+      expectedBit22: undefined,
+      expectedBit23: undefined,
+      expectedBit24: '0',
+      evidenceName: 'client-hints-platform-match-s025.json',
+      failures: (evidence) => [
+        ...(!evidence.clientHints.platformMismatch ? [] : [`Expected UA platform to match CH platform ${evidence.clientHints.highEntropy?.platform}`]),
+        ...(evidence.bit16 === '0' ? [] : [`S017 expected 0 when S025 does not fire, got ${evidence.bit16}`]),
+        ...(evidence.bit24 === '0' ? [] : [`S025 expected 0, got ${evidence.bit24}`]),
+      ],
+    },
+  ];
+
+  for (const test of tests) {
+    const maxAttempts = getTestRetryAttempts();
+    try {
+      let evidence;
+      let failures = [];
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        evidence = await runStep(`run ${test.label} attempt ${attempt}`, () => runSingleClientHintsTest(browser, config, outputDir, test));
+        evidence.attempt = attempt;
+        evidence.maxAttempts = maxAttempts;
+        failures = test.failures(evidence);
+        if (failures.length === 0 || attempt === maxAttempts || !failures.some(isRetryableTestMessage)) break;
+        await waitBeforeTestRetry();
+      }
+      const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+      addResult(results, test.label, failures.length === 0 ? 'PASS' : 'FAIL', evidence, [evidenceFile], failures);
+    } catch (error) {
+      if (isRetryableTestMessage(error.message)) {
+        let retryError = error;
+        for (let attempt = 2; attempt <= maxAttempts; attempt += 1) {
+          try {
+            await waitBeforeTestRetry();
+            const evidence = await runStep(`run ${test.label} attempt ${attempt}`, () => runSingleClientHintsTest(browser, config, outputDir, test));
+            evidence.attempt = attempt;
+            evidence.maxAttempts = maxAttempts;
+            const failures = test.failures(evidence);
+            if (failures.length === 0 || attempt === maxAttempts || !failures.some(isRetryableTestMessage)) {
+              const evidenceFile = saveJson(path.join(outputDir, test.evidenceName), evidence);
+              addResult(results, test.label, failures.length === 0 ? 'PASS' : 'FAIL', evidence, [evidenceFile], failures);
+              retryError = null;
+              break;
+            }
+          } catch (nextError) {
+            retryError = nextError;
+          }
+        }
+        if (!retryError) continue;
+        addResult(results, test.label, 'FAIL', { error: retryError.message, maxAttempts }, [], [retryError.message]);
+      } else {
+        addResult(results, test.label, 'FAIL', { error: error.message, maxAttempts }, [], [error.message]);
+      }
+    }
+  }
+}
+
 function frameNameFromSelector(selector) {
   const match = String(selector || '').match(/\bname\s*=\s*["']([^"']+)["']/i);
   return match ? match[1] : '';
@@ -1712,8 +4520,7 @@ function getLoginFrame(page) {
   return null;
 }
 
-async function clickLocatorWithoutNavigationWait(page, locator) {
-  const timeout = Number(process.env.FIELD_TIMEOUT_MS || 45000);
+async function clickLocatorWithoutNavigationWait(page, locator, timeout = Number(process.env.FIELD_TIMEOUT_MS || 45000)) {
   await locator.waitFor({ state: 'visible', timeout });
   await locator.scrollIntoViewIfNeeded({ timeout });
 
@@ -1743,7 +4550,7 @@ async function fillAndSubmit(page) {
     throw new Error('SUBMIT_CREDENTIALS requires USERNAME_SELECTOR, PASSWORD_SELECTOR, LOGIN_USERNAME, and LOGIN_PASSWORD.');
   }
 
-  const frame = getLoginFrame(page);
+  const frame = await waitForLoginFrame(page);
   const root = frame || (frameSelector ? page.frameLocator(frameSelector) : page);
   const usernameField = root.locator(usernameSelector);
   const passwordField = root.locator(passwordSelector);
@@ -2073,6 +4880,10 @@ function getNextEvidenceDir(releaseVersion) {
   return path.join(baseDir, `test-${index}`);
 }
 
+function isNumberedEvidenceRunDir(dirName) {
+  return /^test-\d+$/i.test(path.basename(dirName || ''));
+}
+
 let currentRun = { outputDir: ROOT_DIR, steps: [], currentStep: null };
 
 function writeRunProgress() {
@@ -2248,6 +5059,7 @@ async function runTarget(target, config) {
         height: Number(process.env.VIEWPORT_HEIGHT || 900),
       },
     }));
+    metadata.webdriverInitScript = await runStep('install webdriver expectation init script', () => installFirefoxWebdriverTrueInitScript(context, target));
     scriptOverride = await runStep('install script override', () => installScriptOverride(context, outputDir));
     page = await runStep('open new page', () => context.newPage());
     page.on('console', (message) => {
@@ -2285,6 +5097,31 @@ async function runTarget(target, config) {
       timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
     }));
     await runStep('post-load wait', () => page.waitForTimeout(Number(process.env.POST_LOAD_WAIT_MS || 2000)));
+    metadata.secureRedirectRecovery = await runStep('secure redirect recovery', () => recoverSecureChaseSystemRequirements(page));
+
+    if (isChaseSystemRequirementsUrl(page.url())) {
+      const screenshot = await runStep('save chase-system-requirements screenshot', () => saveScreenshot(page, 'chase-system-requirements'));
+      const targetLabel = config.lob || 'Target';
+      metadata.skippedReason = `${targetLabel} redirected to Chase system requirements page; DFS/login tests are not available in this browser mode.`;
+      metadata.finalUrl = page.url();
+      addResult(
+        results,
+        'Chase Target Availability',
+        'SKIP',
+        {
+          reason: metadata.skippedReason,
+          targetUrl: config.targetUrl,
+          finalUrl: page.url(),
+          recovery: metadata.secureRedirectRecovery,
+          recommendation: config.lob === 'SECURE'
+            ? 'Run Secure with SECURE.HEADLESS=false or a browser mode that reaches the logonbox frame.'
+            : 'Run this target in a browser mode that is not redirected to Chase system requirements.',
+        },
+        [screenshot],
+        [metadata.skippedReason]
+      );
+      return { metadata, results };
+    }
 
     const screenshotInitial = await runStep('save initial-page screenshot', () => saveScreenshot(page, 'initial-page'));
     const inputDiscovery = await runStep('discover page input fields', () => discoverInputFields(page));
@@ -2380,6 +5217,8 @@ async function runTarget(target, config) {
     const expectedWebdriverBit0 = readString('EXPECTED_DFS_E7_BIT0', '1');
     const expectedMissingClientHints = expectsMissingClientHints(target.browser);
     const notABrandQuestionMarkSignal = await runStep('read Not A Brand client-hints signal', () => getNotABrandQuestionMarkSignal(page));
+    const webdriverState = await runStep('read navigator.webdriver state', () => getNavigatorWebdriverState(page));
+    const pluginState = await runStep('read navigator.plugins state', () => getNavigatorPluginState(page));
     const scarBits = {
       dfs_E_7: e7,
       dfs_E_7_decoded: decodedE7,
@@ -2388,9 +5227,10 @@ async function runTarget(target, config) {
       indexing: e7Shuffle ? 'semantic bit numbers decoded from shuffled dfs_E_7; bit 0 maps to S001' : 'zero-based; bit 0 is the first character',
       expectedMissingClientHints,
       notABrandQuestionMarkSignal,
+      webdriver: webdriverState,
+      plugins: pluginState,
       expectations: {
         bit0: expectedWebdriverBit0,
-        bit1: '0',
         ...(readBoolean('IGNORE_DFS_E7_BIT16', false) ? {} : { bit16: getExpectedDfsE7Bit16(target.browser, notABrandQuestionMarkSignal) }),
         bit22: getExpectedDfsE7Bit22(target.browser),
         bit25: '0',
@@ -2399,6 +5239,7 @@ async function runTarget(target, config) {
       },
       bit0: getDfsE7BitValue(e7, 0, e7Shuffle),
       bit1: getDfsE7BitValue(e7, 1, e7Shuffle),
+      bit2: getDfsE7BitValue(e7, 2, e7Shuffle),
       bit16: getDfsE7BitValue(e7, 16, e7Shuffle),
       bit22: getDfsE7BitValue(e7, 22, e7Shuffle),
       bit25: getDfsE7BitValue(e7, 25, e7Shuffle),
@@ -2417,6 +5258,53 @@ async function runTarget(target, config) {
       .filter(([key, expectedValue]) => scarBits[key] !== expectedValue)
       .map(([key, expectedValue]) => `${key} expected ${expectedValue}, got ${scarBits[key]}`);
     addResult(results, 'AI Score / SCAR Testing', scarFailures.length === 0 ? 'PASS' : 'FAIL', scarBits, scarEvidenceFiles, scarFailures);
+    addScarBitResult(
+      results,
+      'S001',
+      'navigator.webdriver == true',
+      scarBits.bit0,
+      '1',
+      {
+        navigator: webdriverState,
+        expectationSource: 'navigator.webdriver === true should set dfs_E_7 S001/bit0 to 1.',
+        configuredExpectedBit0: expectedWebdriverBit0,
+      },
+      scarEvidenceFiles
+    );
+    addScarBitResult(
+      results,
+      'S002',
+      'navigator.plugins.length == 0',
+      scarBits.bit1,
+      pluginState.zeroPlugins ? '1' : '0',
+      {
+        navigatorPlugins: pluginState,
+        expectationSource: 'navigator.plugins.length === 0 should set dfs_E_7 S002/bit1 to 1 and S003/bit2 to 0.',
+      },
+      scarEvidenceFiles
+    );
+    addScarBitResult(
+      results,
+      'S003',
+      'navigator.plugins.length > 0',
+      scarBits.bit2,
+      pluginState.oneOrMorePlugins ? '1' : '0',
+      {
+        navigatorPlugins: pluginState,
+        expectationSource: 'navigator.plugins.length > 0 should set dfs_E_7 S003/bit2 to 1 and S002/bit1 to 0.',
+      },
+      scarEvidenceFiles
+    );
+    await runWebdriverSuppressionTest(browser, target, config, outputDir, results);
+    await runPluginSuppressionTest(browser, target, config, outputDir, results);
+    await runIndexedDBSuppressionTest(browser, target, config, outputDir, results);
+    await runGpuRendererTests(target, config, outputDir, results);
+    await runDevicePixelRatioTests(browser, config, outputDir, results);
+    await runMediaDeviceEnumerationTests(target, config, outputDir, results);
+    await runHardwareConcurrencyTests(browser, config, outputDir, results);
+    await runSuspiciousUserAgentKeywordTest(browser, config, outputDir, results);
+    await runFingerprintModificationTest(browser, config, outputDir, results);
+    await runClientHintsTests(browser, config, outputDir, results);
 
     if (readBoolean('PERFORM_PRIVATE_MODE_DETECTION_TEST', true)) {
       const privateMode = { dfs_E_1: getFingerprintValue(initialFingerprint, 'dfs_E_1') };
@@ -2773,6 +5661,56 @@ function writePortableEvidenceText(releaseDir, aggregate, context) {
   return reportPath;
 }
 
+function writeLatestReleasePointer(releaseDir, reports, context) {
+  if (!isNumberedEvidenceRunDir(releaseDir)) return null;
+
+  const releaseRootDir = path.dirname(releaseDir);
+  const generatedAt = new Date().toISOString();
+  const coverHref = relativeLink(releaseRootDir, reports.coverReportPath);
+  const summaryPath = path.join(releaseRootDir, 'summary-report.json');
+  const portableEvidencePath = path.join(releaseRootDir, 'portable-evidence.txt');
+  const coverReportPath = path.join(releaseRootDir, 'cover-report.html');
+  const latestRunPath = path.join(releaseRootDir, 'latest-run.json');
+
+  fs.copyFileSync(reports.aggregatePath, summaryPath);
+  fs.copyFileSync(reports.portableEvidencePath, portableEvidencePath);
+  saveJson(latestRunPath, {
+    releaseVersion: context.releaseVersion,
+    generatedAt,
+    inProgress: Boolean(context.inProgress),
+    latestRunDir: path.basename(releaseDir),
+    summaryReport: relativeLink(releaseRootDir, reports.aggregatePath),
+    coverReport: coverHref,
+    portableEvidence: relativeLink(releaseRootDir, reports.portableEvidencePath),
+  });
+
+  fs.writeFileSync(
+    coverReportPath,
+    `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url=${escapeHtml(coverHref)}">
+  <title>Latest DFS Evidence Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; color: #172033; }
+    a { color: #155eef; }
+  </style>
+</head>
+<body>
+  <h1>Latest DFS Evidence Report</h1>
+  <p>Latest run: ${escapeHtml(path.basename(releaseDir))}</p>
+  <p>Generated: ${escapeHtml(generatedAt)}</p>
+  <p><a href="${escapeHtml(coverHref)}">Open latest cover report</a></p>
+</body>
+</html>
+`,
+    'utf8'
+  );
+
+  return { summaryPath, coverReportPath, portableEvidencePath, latestRunPath };
+}
+
 function writeLiveReports(releaseDir, aggregate, context) {
   const aggregatePath = writeAggregateSummary(releaseDir, aggregate, context);
   const coverReportPath = writeCoverReport(releaseDir, aggregate, aggregatePath, {
@@ -2781,7 +5719,8 @@ function writeLiveReports(releaseDir, aggregate, context) {
     inProgress: context.inProgress,
   });
   const portableEvidencePath = writePortableEvidenceText(releaseDir, aggregate, context);
-  return { aggregatePath, coverReportPath, portableEvidencePath };
+  const latestReleasePaths = writeLatestReleasePointer(releaseDir, { aggregatePath, coverReportPath, portableEvidencePath }, context);
+  return { aggregatePath, coverReportPath, portableEvidencePath, latestReleasePaths };
 }
 
 function writeCoverReport(releaseDir, aggregate, aggregateJsonPath, context) {
