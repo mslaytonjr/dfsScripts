@@ -454,7 +454,7 @@ evidence/<releaseversion>/summary-report.json
   - S015 appears as a suspicious user-agent control; optional `PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=true` runs a context with `SUSPICIOUS_UA_STRING` containing `SUSPICIOUS_UA_KEYWORD`
   - S016 appears as a fingerprint modification control; optional `PERFORM_FINGERPRINT_MODIFICATION_TEST=true` waits for `dfs_F_1`, tampers it to `TAMPERED`, reloads to trigger re-collection, and expects S016 to fire
   - S018/S019/S020/S021/S023/S017/S024/S025 appear as client-hints and UA spoofing controls; optional `PERFORM_CLIENT_HINTS_TESTS=true` runs Apple-signature, WebGL renderer anomaly, client-hints brand quirk, locale/timezone mismatch, empty, populated, UA/CH version-mismatched, UA/CH version-matched, UA/CH platform-mismatched, and UA/CH platform-matched contexts. S018, S019, S020, S021, S024, and S025 mismatches also expect S017 to fire.
-  - bit 16 and bit 22 default to `0`, unless the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
+  - bit 16 defaults to `1` when `navigator.userAgentData` is missing, when a Not A Brand client-hints brand contains `?`, or when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`; bit 22 defaults to `1` when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
   - bits 25, 26, and 27 default to `0`
 - `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
 - Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`

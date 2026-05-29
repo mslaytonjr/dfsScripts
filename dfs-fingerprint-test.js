@@ -978,8 +978,12 @@ function expectsMissingClientHints(browser) {
   return getBrowsersExpectingMissingClientHints().has(String(browser || '').toLowerCase());
 }
 
-function getExpectedDfsE7Bit16(browser, notABrandQuestionMarkSignal) {
-  return expectsMissingClientHints(browser) || Boolean(notABrandQuestionMarkSignal && notABrandQuestionMarkSignal.triggered) ? '1' : '0';
+function getExpectedDfsE7Bit16(browser, userAgentDataSignal) {
+  return expectsMissingClientHints(browser) ||
+    Boolean(userAgentDataSignal && userAgentDataSignal.userAgentDataPresent === false) ||
+    Boolean(userAgentDataSignal && userAgentDataSignal.triggered)
+    ? '1'
+    : '0';
 }
 
 function getExpectedDfsE7Bit22(browser) {
@@ -1019,10 +1023,13 @@ async function getNotABrandQuestionMarkSignal(page) {
         .filter((item) => item.brand);
     }
 
-    const lowEntropy = navigator.userAgentData && typeof navigator.userAgentData.toJSON === 'function'
+    const userAgentDataPresent = Boolean(navigator.userAgentData);
+    const userAgentDataToJsonPresent = Boolean(navigator.userAgentData && typeof navigator.userAgentData.toJSON === 'function');
+    const userAgentDataHighEntropyPresent = Boolean(navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function');
+    const lowEntropy = userAgentDataToJsonPresent
       ? navigator.userAgentData.toJSON()
       : null;
-    const highEntropy = navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function'
+    const highEntropy = userAgentDataHighEntropyPresent
       ? await navigator.userAgentData.getHighEntropyValues(['brands', 'fullVersionList'])
         .catch((error) => ({ error: error.message }))
       : null;
@@ -1035,11 +1042,14 @@ async function getNotABrandQuestionMarkSignal(page) {
 
     return {
       triggered: matches.length > 0,
+      userAgentDataPresent,
+      userAgentDataToJsonPresent,
+      userAgentDataHighEntropyPresent,
       matches,
       brandEntries,
       lowEntropy,
       highEntropy,
-      rule: 'Expect dfs_E_7 bit16 to be 1 when a Not A Brand client-hints brand contains "?".',
+      rule: 'Expect dfs_E_7 bit16 to be 1 when navigator.userAgentData is missing or a Not A Brand client-hints brand contains "?".',
     };
   });
 }
@@ -2605,12 +2615,19 @@ async function performInteractionScenario(page, scenarioName) {
       break;
     case 'payload_coverage':
       await maybeMoveMouse(page);
-      const point = await getInteractionTargetPoint(page);
+      const point = await getRootInteractionTargetPoint(page, root);
       await page.mouse.click(point.x, point.y);
       await page.mouse.dblclick(point.x + 8, point.y + 8);
       await page.mouse.click(point.x + 16, point.y + 16, { button: 'right' });
       await page.mouse.wheel(0, 250);
-      await page.evaluate(() => window.scrollBy(0, 250));
+      if (root && typeof root.evaluate === 'function') {
+        await root.evaluate(() => window.scrollBy(0, 250));
+      } else if (root && typeof root.locator === 'function') {
+        await root.locator('body').evaluate(() => window.scrollBy(0, 250));
+      } else {
+        await page.evaluate(() => window.scrollBy(0, 250));
+      }
+      scenarioDetails.payloadPoint = point;
       if (config.usernameSelector) {
         await fillWithHumanTyping(page, root, config.usernameSelector, username);
         scenarioDetails.payloadPaste = await pasteIntoField(page, root, config.usernameSelector, `${username}2`);
