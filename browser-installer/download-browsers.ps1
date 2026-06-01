@@ -59,6 +59,117 @@ function Write-Ok($m)   { Write-Host "    OK: $m" -ForegroundColor Green }
 function Write-Warn($m) { Write-Host "    WARN: $m" -ForegroundColor Yellow }
 function Write-Err($m)  { Write-Host "    ERROR: $m" -ForegroundColor Red }
 
+function ConvertTo-VersionOrNull {
+    param([string]$Value)
+    try {
+        return [version]$Value
+    } catch {
+        return $null
+    }
+}
+
+function Resolve-EdgeVersionForChromeMajor {
+    param([string]$Major)
+
+    try {
+        if (-not $script:EdgeProductsCache) {
+            $script:EdgeProductsCache = Invoke-RestMethod -Uri "https://edgeupdates.microsoft.com/api/products" -UseBasicParsing
+        }
+
+        $stable = $script:EdgeProductsCache | Where-Object { $_.Product -eq 'Stable' } | Select-Object -First 1
+        if (-not $stable) { return $null }
+
+        $release = $stable.Releases |
+            Where-Object {
+                $_.ProductVersion -like "$Major.*" -and
+                $_.Platform -eq 'Windows' -and
+                $_.Architecture -eq 'x64'
+            } |
+            Sort-Object { ConvertTo-VersionOrNull $_.ProductVersion } -Descending |
+            Select-Object -First 1
+
+        if ($release) { return [string]$release.ProductVersion }
+    } catch {
+        Write-Warn "Could not resolve Edge version for Chromium/Chrome major $Major from Microsoft update API: $_"
+    }
+
+    return $null
+}
+
+function Get-OperaChromiumMajorOffset {
+    param($Map)
+
+    if (-not $Map) { return $null }
+
+    $offsetCounts = @{}
+    foreach ($property in $Map.PSObject.Properties) {
+        $chromeMajor = 0
+        if (-not [int]::TryParse($property.Name, [ref]$chromeMajor)) { continue }
+
+        $operaVersion = [string]$property.Value
+        if ($operaVersion -notmatch '^(\d+)\.') { continue }
+
+        $operaMajor = [int]$Matches[1]
+        $offset = $chromeMajor - $operaMajor
+        if ($offset -lt 5 -or $offset -gt 30) { continue }
+
+        $key = [string]$offset
+        if (-not $offsetCounts.ContainsKey($key)) { $offsetCounts[$key] = 0 }
+        $offsetCounts[$key] += 1
+    }
+
+    if ($offsetCounts.Count -eq 0) { return $null }
+
+    return [int](($offsetCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key)
+}
+
+function Resolve-OperaVersionForChromeMajor {
+    param(
+        [string]$Major,
+        $Map
+    )
+
+    try {
+        $offset = Get-OperaChromiumMajorOffset $Map
+        if ($null -eq $offset) {
+            Write-Warn "Could not infer Opera-to-Chromium major offset from existing alignment table"
+            return $null
+        }
+
+        $operaMajor = [int]$Major - $offset
+        if ($operaMajor -le 0) { return $null }
+
+        if (-not $script:OperaDesktopIndexCache) {
+            $script:OperaDesktopIndexCache = (Invoke-WebRequest -Uri "https://get.opera.com/pub/opera/desktop/" -UseBasicParsing).Content
+        }
+
+        $versions = [regex]::Matches($script:OperaDesktopIndexCache, 'href="(?<version>\d+\.\d+\.\d+\.\d+)/"') |
+            ForEach-Object { $_.Groups['version'].Value } |
+            Where-Object { $_ -like "$operaMajor.*" } |
+            Sort-Object { ConvertTo-VersionOrNull $_ } -Descending
+
+        return $versions | Select-Object -First 1
+    } catch {
+        Write-Warn "Could not resolve Opera version for Chromium/Chrome major $Major from Opera package index: $_"
+    }
+
+    return $null
+}
+
+function Resolve-AlignedBrowserVersion {
+    param(
+        [string]$Browser,
+        [string]$ChromeMajor,
+        $Map
+    )
+
+    switch ($Browser) {
+        'edge'  { return Resolve-EdgeVersionForChromeMajor $ChromeMajor }
+        'opera' { return Resolve-OperaVersionForChromeMajor -Major $ChromeMajor -Map $Map }
+        default { return $null }
+    }
+}
+
 function Get-ConfiguredVersions {
     param([string]$Browser)
 
@@ -77,11 +188,18 @@ function Get-ConfiguredVersions {
             $major = ($sourceVersion -split '\.')[0]
             $mappedProperty = $map.Value.PSObject.Properties[$major]
             if (-not $mappedProperty -or -not $mappedProperty.Value) {
-                Write-Warn "No $Browser mapping configured for Chromium/Chrome major $major from $sourceVersion"
-                continue
+                $resolvedVersion = Resolve-AlignedBrowserVersion -Browser $Browser -ChromeMajor $major -Map $map.Value
+                if (-not $resolvedVersion) {
+                    Write-Warn "No $Browser mapping configured or resolved for Chromium/Chrome major $major from $sourceVersion"
+                    continue
+                }
+
+                Write-Info "Resolved $Browser $resolvedVersion for Chromium/Chrome major $major"
+                $mappedVersion = [string]$resolvedVersion
+            } else {
+                $mappedVersion = [string]$mappedProperty.Value
             }
 
-            $mappedVersion = [string]$mappedProperty.Value
             if ($seen.Add($mappedVersion)) {
                 $mappedVersions.Add($mappedVersion)
             }

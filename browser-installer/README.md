@@ -75,7 +75,7 @@ The script auto-detects Apple Silicon vs Intel and pulls the right architecture.
 
 ## Editing `versions.json`
 
-Only the `browsers` object matters — the `_comment` and `_format` keys are documentation. Add or remove versions freely:
+The `browsers` object controls the versions to install. Add or remove versions freely:
 
 ```json
 {
@@ -90,6 +90,13 @@ Only the `browsers` object matters — the `_comment` and `_format` keys are doc
 ```
 
 Empty arrays are fine — that browser just gets skipped.
+
+`_chromium_alignment.edge` and `_chromium_alignment.opera` are optional manual overrides for Chromium-based browser alignment. If a Chrome major is missing from those maps, the Windows installer tries to resolve it automatically:
+
+- Edge resolves from Microsoft's public Edge update API.
+- Opera infers the Opera major from the existing alignment offset and picks the newest matching package from Opera's public desktop package index.
+
+If the vendor has not published a build for that Chrome/Chromium major yet, the installer prints a warning and skips that major for that browser.
 
 ## What gets installed where
 
@@ -158,7 +165,7 @@ npx playwright test --project=chromium-125.0.6422.112
 
 ## Caveats
 
-- **Chrome, Edge, and Opera versioning differs.** The `chrome` key downloads official Chrome for Testing from Google. Edge and Opera do not use Chrome's exact full version numbers, so they are matched by Chromium major version.
+- **Chrome, Edge, and Opera versioning differs.** The `chrome` key downloads official Chrome for Testing from Google. Edge and Opera do not use Chrome's exact full version numbers, so they are matched by Chromium major version. Missing Edge and Opera mappings are resolved automatically when possible.
 - **Edge URL pattern can break.** Microsoft sometimes restructures their download mirrors. If the script can't find a version, the warning message tells you where to download manually.
 - **Old versions may 404.** Vendors prune very old builds eventually. Opera typically keeps ~3 years; Firefox keeps everything; Brave keeps everything on GitHub.
 - **First run is slow.** Each version is 100-200 MB compressed; expect 5-10 minutes for a full install of 15-20 versions on a decent connection.
