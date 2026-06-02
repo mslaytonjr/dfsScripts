@@ -297,7 +297,10 @@ install_brave() {
 IFS=',' read -ra BROWSER_LIST <<< "$BROWSERS"
 for browser in "${BROWSER_LIST[@]}"; do
     step "Installing $browser"
-    mapfile -t vlist < <(versions_for "$browser")
+    vlist=()
+    while IFS= read -r version; do
+        [[ -n "$version" ]] && vlist+=("$version")
+    done < <(versions_for "$browser")
     if [[ ${#vlist[@]} -eq 0 ]]; then
         warn "No versions configured for $browser"
         continue
