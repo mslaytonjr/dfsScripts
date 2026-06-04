@@ -148,7 +148,7 @@ PERFORM_MOUSE_MOVEMENT=true
 DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 PERFORM_INTERACTION_SCENARIO_TESTS=true
-INTERACTION_TEST_SCENARIOS=human_typing,payload_coverage
+INTERACTION_TEST_SCENARIOS=value_injection,synthetic_events,pointer_lock,pointer_travel,injected_text,cadence_rigidity,human_like_cadence,focus_anomaly,dwell_missing_keyups,dwell_short_holds,fill_speed,paste_fragmentation,human_baseline,human_pause_baseline,human_mouse_path
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 EXPECTED_DFS_E7_BIT0=1
 FIREFOX_FORCE_WEBDRIVER_TRUE=true
@@ -178,9 +178,11 @@ Keep `HEADLESS=true` for request-capture flows where headed browser automation c
 
 Use `SCRIPT_OVERRIDE_*` to replace `dfs.js` and `LEVO_SCRIPT_OVERRIDE_*` to replace `levo.js`. Each override needs both a match pattern and a source path or HTTPS URL.
 
-Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for browser keys that are expected not to provide client hints such as `sec-ch-ua` / `sec-ch-ua-full-version-list`. For those browsers, `dfs_E_7` bit 16 and bit 22 are both expected to be `1`. The older `DFS_E7_BIT22_EXPECTED_1_BROWSERS` and `CLIENT_HINTS_MISSING_BROWSERS` names are still accepted as aliases.
+Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for legacy bitstring runs where browser keys are expected not to provide client hints such as `sec-ch-ua` / `sec-ch-ua-full-version-list`. For those browsers, `dfs_E_7` bit 16 and bit 22 are both expected to be `1`. The older `DFS_E7_BIT22_EXPECTED_1_BROWSERS` and `CLIENT_HINTS_MISSING_BROWSERS` names are still accepted as aliases.
 
-Set `DFS_E7_BIT_SHUFFLE_ENABLED=true` when `dfs_E_7` is emitted in shuffled order. The runner derives the shuffle seed from `parseInt(dfs_F_5.slice(0, 8), 16)`, uses Mulberry32 returning a raw uint32, applies descending Fisher-Yates with `rand() % (i + 1)` to `S001` through `S032`, and then evaluates semantic bit numbers against the shuffled positions. `DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index` means semantic bit N reads from the position named by shuffled label N; use `find-label` if semantic bit N is stored where `S00N` landed.
+For the new numeric `dfs_E_7` score-token format, the runner splits the value into 2-digit tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, then six per-field dimensions per suspicious field. `DFS_E7_FORMAT=auto` detects this format by default; set `DFS_E7_FORMAT=legacy-bitstring` only for old 32-bit binary runs. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
+
+Set `DFS_E7_BIT_SHUFFLE_ENABLED=true` only for legacy bitstring `dfs_E_7` runs emitted in shuffled order. The runner derives the legacy bit shuffle seed from `parseInt(dfs_F_5.slice(0, 8), 16)`, uses Mulberry32 returning a raw uint32, applies descending Fisher-Yates with `rand() % (i + 1)` to `S001` through `S032`, and then evaluates semantic bit numbers against the shuffled positions. `DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index` means semantic bit N reads from the position named by shuffled label N; use `find-label` if semantic bit N is stored where `S00N` landed.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -190,22 +192,27 @@ For Chase runs that land on the system-requirements page, the runner marks the t
 
 Transient interaction and spoofing-control failures are retried with `TEST_RETRY_ATTEMPTS=3` and `TEST_RETRY_DELAY_MS=3000`. Retries are limited to page-readiness failures such as missing selectors, null/undefined reads, detached frames, destroyed execution contexts, or timeouts; bit assertion mismatches still fail immediately.
 
-Valid interaction scenarios:
+Valid numeric `dfs_E_7` score-token interaction scenarios:
 
 ```text
-human_typing           normal mouse movement plus slower username/password typing
-bot_fast_typing        fast typing that should trigger bot-like input bits
-robotic_typing_cadence type user123 with uniform 50ms delay; expects S026/S022
-paste                  paste into the username field; expects S028/S022
-programmatic_input     set username via untrusted input event; expects S027/S022
-mouse_teleport         jump pointer across the viewport; expects S029/S022
-low_mouse_activity     wait 3s with no mouse movement; expects S030/S022
-focus_input_speed      focus username/password and type very quickly; expects S031/S022
-rapid_click_pattern    5+ rapid clicks; expects S032
-rapid_scroll_pattern   5+ rapid scrolls; expects S032
-scroll_click_pattern   legacy combined repeated clicks and wheel scrolling
-payload_coverage       mixed mouse/input events; expects dfs_F_2 to change
+value_injection        direct el.value assignment on 3+ fields; token[0] >= 80
+synthetic_events       dispatch untrusted input/change events; token[1] >= 80
+pointer_lock           center-click 5+ controls; token[2] >= 60
+pointer_travel         click targets without intermediate mousemove path; token[3] >= 50
+injected_text          direct username value assignment; token[4] >= 90
+paste_fragmentation    3 insertText chunks in one field; token[5] >= 90
+cadence_rigidity       fixed 50ms username typing; token[6] >= 80
+human_like_cadence     variable 60-180ms username typing; token[6] <= 30
+focus_anomaly          input event before focus; token[7] >= 90
+dwell_missing_keyups   repeated keydown events without keyup; token[8] >= 90
+dwell_short_holds      immediate keydown/keyup pairs; token[8] >= 80
+fill_speed             5ms/char password typing; token[9] >= 85
+human_baseline         random cadence and offset submit; all tokens <= 0
+human_pause_baseline   short pause mid-typing; all tokens <= 20
+human_mouse_path       mousemove path between actions; token[3] <= 20
 ```
+
+Aliases `A1` through `A4`, `B1` through `B8`, and `C1` through `C3` map to the scenarios above. Legacy interaction scenario names such as `human_typing`, `programmatic_input`, and `payload_coverage` are still accepted for older bitstring runs.
 
 To scan the loaded page and list candidate username, password, and submit selectors without running the full validation:
 
@@ -439,7 +446,11 @@ evidence/<releaseversion>/summary-report.json
 - Required DFS cookies on page load, including `dfs_E_4`
 - Cookie-to-fingerprint comparisons
 - `dfs_E_6` browser detection format and consistency
-- `dfs_E_7` SCAR bit expectations
+- `dfs_E_7` score-token expectations for the numeric agentic detection wire format
+  - numeric values are split into 2-digit tokens and de-permuted from `dfs_E_5`
+  - interaction scenarios validate global dimensions and per-field dimensions by canonical token position
+  - old S001-S032 bit assertions are skipped automatically when numeric score-token format is detected
+- Legacy `dfs_E_7` SCAR bit expectations for older binary bitstring runs
   - shuffled bit strings can be decoded with `DFS_E7_BIT_SHUFFLE_ENABLED=true`
   - bit 0 defaults to `1` for Playwright-launched webdriver sessions where `navigator.webdriver === true`
   - Firefox can force `navigator.webdriver === true` for the normal positive bit0 run with `FIREFOX_FORCE_WEBDRIVER_TRUE=true`
@@ -458,7 +469,7 @@ evidence/<releaseversion>/summary-report.json
   - bits 25, 26, and 27 default to `0`
 - `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
 - Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`
-- Interaction SCAR bit expectations; set `IGNORE_INTERACTION_SCAR_BITS=21,31` to ignore specific behavior bits while still collecting evidence
+- Interaction score-token expectations for agentic detection; legacy interaction SCAR bit expectations still run only for legacy bitstring scenarios
 - `dfs_B*`, `dfs_D*`, `dfs_I*`, `dfs_M*`, and `dfs_N*` payload availability
 - Optional mouse movement and `dfs_F_2` comparison
 - `dfs_F_1` stability across reload
