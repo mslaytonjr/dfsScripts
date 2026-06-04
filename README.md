@@ -150,23 +150,8 @@ SUBMIT_CREDENTIALS=false
 PERFORM_INTERACTION_SCENARIO_TESTS=true
 INTERACTION_TEST_SCENARIOS=value_injection,synthetic_events,pointer_lock,pointer_travel,injected_text,cadence_rigidity,human_like_cadence,focus_anomaly,dwell_missing_keyups,dwell_short_holds,fill_speed,paste_fragmentation,human_baseline,human_pause_baseline,human_mouse_path
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
-EXPECTED_DFS_E7_BIT0=1
-FIREFOX_FORCE_WEBDRIVER_TRUE=true
-PERFORM_WEBDRIVER_SUPPRESSION_TEST=false
-PERFORM_PLUGIN_SUPPRESSION_TEST=false
-PERFORM_INDEXEDDB_SUPPRESSION_TEST=false
-PERFORM_GPU_RENDERER_TESTS=false
-PERFORM_DEVICE_PIXEL_RATIO_TESTS=false
-PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=false
-PERFORM_HARDWARE_CONCURRENCY_TESTS=false
-PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=false
-SUSPICIOUS_UA_KEYWORD=Googlebot
-SUSPICIOUS_UA_STRING=Mozilla/5.0 (compatible; Googlebot/2.1; +https://www.google.com/bot.html)
-PERFORM_FINGERPRINT_MODIFICATION_TEST=false
-PERFORM_CLIENT_HINTS_TESTS=false
-DFS_E7_BIT_SHUFFLE_ENABLED=false
-DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index
-DFS_E7_CLIENT_HINTS_MISSING_BROWSERS=opera
+DFS_E7_FORMAT=auto
+DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index
 POST_LOAD_WAIT_MS=2000
 SCRIPT_OVERRIDE_MATCH=/aegis-binaries\/dfs\.js/i
 SCRIPT_OVERRIDE_SOURCE=C:\GitRepo\dfsScripts\.ignore\dfs121beta.js
@@ -178,11 +163,7 @@ Keep `HEADLESS=true` for request-capture flows where headed browser automation c
 
 Use `SCRIPT_OVERRIDE_*` to replace `dfs.js` and `LEVO_SCRIPT_OVERRIDE_*` to replace `levo.js`. Each override needs both a match pattern and a source path or HTTPS URL.
 
-Use `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS` for legacy bitstring runs where browser keys are expected not to provide client hints such as `sec-ch-ua` / `sec-ch-ua-full-version-list`. For those browsers, `dfs_E_7` bit 16 and bit 22 are both expected to be `1`. The older `DFS_E7_BIT22_EXPECTED_1_BROWSERS` and `CLIENT_HINTS_MISSING_BROWSERS` names are still accepted as aliases.
-
-For the new numeric `dfs_E_7` score-token format, the runner splits the value into 2-digit tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, then six per-field dimensions per suspicious field. `DFS_E7_FORMAT=auto` detects this format by default; set `DFS_E7_FORMAT=legacy-bitstring` only for old 32-bit binary runs. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
-
-Set `DFS_E7_BIT_SHUFFLE_ENABLED=true` only for legacy bitstring `dfs_E_7` runs emitted in shuffled order. The runner derives the legacy bit shuffle seed from `parseInt(dfs_F_5.slice(0, 8), 16)`, uses Mulberry32 returning a raw uint32, applies descending Fisher-Yates with `rand() % (i + 1)` to `S001` through `S032`, and then evaluates semantic bit numbers against the shuffled positions. `DFS_E7_BIT_SHUFFLE_MAPPING=semantic-index-to-label-index` means semantic bit N reads from the position named by shuffled label N; use `find-label` if semantic bit N is stored where `S00N` landed.
+For numeric `dfs_E_7`, the runner splits the value into 2-digit score tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, then six per-field dimensions per suspicious field. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -212,7 +193,7 @@ human_pause_baseline   short pause mid-typing; all tokens <= 20
 human_mouse_path       mousemove path between actions; token[3] <= 20
 ```
 
-Aliases `A1` through `A4`, `B1` through `B8`, and `C1` through `C3` map to the scenarios above. Legacy interaction scenario names such as `human_typing`, `programmatic_input`, and `payload_coverage` are still accepted for older bitstring runs.
+Aliases `A1` through `A4`, `B1` through `B8`, and `C1` through `C3` map to the scenarios above.
 
 To scan the loaded page and list candidate username, password, and submit selectors without running the full validation:
 
@@ -427,7 +408,7 @@ Each browser/version run may include:
 - `cookies-after-submit.json`
 - `network-login-request.json`
 - `fingerprint-values.txt`
-- `scar-bit16-failure-signals.json`
+- `dfs-e7-score-token-evaluation.json`
 - `summary-report.json`
 - `screenshots/*.png`
 
@@ -449,27 +430,9 @@ evidence/<releaseversion>/summary-report.json
 - `dfs_E_7` score-token expectations for the numeric agentic detection wire format
   - numeric values are split into 2-digit tokens and de-permuted from `dfs_E_5`
   - interaction scenarios validate global dimensions and per-field dimensions by canonical token position
-  - old S001-S032 bit assertions are skipped automatically when numeric score-token format is detected
-- Legacy `dfs_E_7` SCAR bit expectations for older binary bitstring runs
-  - shuffled bit strings can be decoded with `DFS_E7_BIT_SHUFFLE_ENABLED=true`
-  - bit 0 defaults to `1` for Playwright-launched webdriver sessions where `navigator.webdriver === true`
-  - Firefox can force `navigator.webdriver === true` for the normal positive bit0 run with `FIREFOX_FORCE_WEBDRIVER_TRUE=true`
-  - optional `PERFORM_WEBDRIVER_SUPPRESSION_TEST=true` runs a negative control with `navigator.webdriver` suppressed and expects bit 0 to become `0`
-  - S001 also appears as separate report-grid rows: `S001 navigator.webdriver == true` and `S001 navigator.webdriver suppressed`
-  - S002/S003 appear as separate rows for `navigator.plugins.length == 0` and `navigator.plugins.length > 0`; optional `PERFORM_PLUGIN_SUPPRESSION_TEST=true` runs a zero-plugin negative-control context
-  - S004 appears as `S004 window.indexedDB unavailable`; optional `PERFORM_INDEXEDDB_SUPPRESSION_TEST=true` runs a context with `window.indexedDB` overridden to `undefined`
-  - S005/S006/S007 appear as GPU/WebGL controls; optional `PERFORM_GPU_RENDERER_TESTS=true` uses Chromium with mocked WebGL values. S005 uses `--headless=new --disable-gpu`; S006 uses `--headless=new` with a software renderer string; S007 mocks `getSupportedExtensions()` to fewer than 15 entries.
-  - S008/S009/S010 appear as DPR controls; optional `PERFORM_DEVICE_PIXEL_RATIO_TESTS=true` runs three contexts for `devicePixelRatio < 1`, `== 1`, and `>= 2`, asserting all three bits in each case
-  - S011 appears as media-device enumeration controls; optional `PERFORM_MEDIA_DEVICE_ENUMERATION_TESTS=true` runs headless contexts where `enumerateDevices()` returns `[]` and rejects
-  - S012/S013/S014 appear as hardware-concurrency controls; optional `PERFORM_HARDWARE_CONCURRENCY_TESTS=true` runs three contexts for `navigator.hardwareConcurrency == 1`, `> 1 and < 5`, and `>= 5`, asserting all three bits in each case
-  - S015 appears as a suspicious user-agent control; optional `PERFORM_SUSPICIOUS_UA_KEYWORD_TEST=true` runs a context with `SUSPICIOUS_UA_STRING` containing `SUSPICIOUS_UA_KEYWORD`
-  - S016 appears as a fingerprint modification control; optional `PERFORM_FINGERPRINT_MODIFICATION_TEST=true` waits for `dfs_F_1`, sets `localStorage.browserFingerPrint` to `bad_value`, reloads to trigger re-collection, and expects S016 to fire
-  - S018/S019/S020/S021/S023/S017/S024/S025 appear as client-hints and UA spoofing controls; optional `PERFORM_CLIENT_HINTS_TESTS=true` runs Apple-signature, WebGL renderer anomaly, client-hints brand quirk, locale/timezone mismatch, empty, populated, UA/CH version-mismatched, UA/CH version-matched, UA/CH platform-mismatched, and UA/CH platform-matched contexts. S018, S019, S020, S021, S024, and S025 mismatches also expect S017 to fire.
-  - bit 16 defaults to `1` when `navigator.userAgentData` is missing, when a Not A Brand client-hints brand contains `?`, or when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`; bit 22 defaults to `1` when the browser key is listed in `DFS_E7_CLIENT_HINTS_MISSING_BROWSERS`
-  - bits 25, 26, and 27 default to `0`
 - `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
 - Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`
-- Interaction score-token expectations for agentic detection; legacy interaction SCAR bit expectations still run only for legacy bitstring scenarios
+- Interaction score-token expectations for agentic detection
 - `dfs_B*`, `dfs_D*`, `dfs_I*`, `dfs_M*`, and `dfs_N*` payload availability
 - Optional mouse movement and `dfs_F_2` comparison
 - `dfs_F_1` stability across reload
