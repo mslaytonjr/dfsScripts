@@ -148,7 +148,7 @@ PERFORM_MOUSE_MOVEMENT=true
 DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 PERFORM_INTERACTION_SCENARIO_TESTS=true
-INTERACTION_TEST_SCENARIOS=value_injection,synthetic_events,pointer_lock,pointer_travel,injected_text,cadence_rigidity,human_like_cadence,focus_anomaly,dwell_missing_keyups,dwell_short_holds,fill_speed,paste_fragmentation,human_baseline,human_pause_baseline,human_mouse_path
+INTERACTION_TEST_SCENARIOS=A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8,B9,B10,B11,C1,C2,C3,C4
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 DFS_E7_FORMAT=auto
 DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index
@@ -163,7 +163,7 @@ Keep `HEADLESS=true` for request-capture flows where headed browser automation c
 
 Use `SCRIPT_OVERRIDE_*` to replace `dfs.js` and `LEVO_SCRIPT_OVERRIDE_*` to replace `levo.js`. Each override needs both a match pattern and a source path or HTTPS URL.
 
-For numeric `dfs_E_7`, the runner splits the value into 2-digit score tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, then six per-field dimensions per suspicious field. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
+For numeric `dfs_E_7`, the runner splits the value into 2-digit score tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, token 4 `coldFocus`, then eight per-field dimensions per suspicious field. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -180,20 +180,25 @@ value_injection        direct el.value assignment on 3+ fields; token[0] >= 80
 synthetic_events       dispatch untrusted input/change events; token[1] >= 80
 pointer_lock           center-click 5+ controls; token[2] >= 60
 pointer_travel         click targets without intermediate mousemove path; token[3] >= 50
-injected_text          direct username value assignment; token[4] >= 90
-paste_fragmentation    3 insertText chunks in one field; token[5] >= 90
-cadence_rigidity       fixed 50ms username typing; token[6] >= 80
-human_like_cadence     variable 60-180ms username typing; token[6] <= 30
-focus_anomaly          input event before focus; token[7] >= 90
-dwell_missing_keyups   repeated keydown events without keyup; token[8] >= 90
-dwell_short_holds      immediate keydown/keyup pairs; token[8] >= 80
-fill_speed             5ms/char password typing; token[9] >= 85
+cold_focus             programmatic focus on 3+ fields; token[4] >= 80
+injected_text          direct username value assignment; token[5] >= 90
+paste_fragmentation    3 insertText chunks in one field; token[6] >= 90
+cadence_rigidity       fixed 50ms username typing; token[7] >= 80
+human_like_cadence     variable 60-180ms username typing; token[7] <= 30
+focus_anomaly          input event before focus; token[8] >= 90
+dwell_missing_keyups   repeated keydown events without keyup; token[9] >= 90
+dwell_short_holds      immediate keydown/keyup pairs; token[9] >= 80
+fill_speed             5ms/char password typing; token[10] >= 85
+focus_no_pointer       programmatic focus then type; token[11] = 99
+key_input_mismatch_cdp CDP Input.insertText without keydowns; token[12] >= 90; Chromium only
+key_input_mismatch_paste_negative paste-style insert should not fire mismatch; token[12] = 0
 human_baseline         random cadence and offset submit; all tokens <= 0
 human_pause_baseline   short pause mid-typing; all tokens <= 20
 human_mouse_path       mousemove path between actions; token[3] <= 20
+browser_autofill_suppression validates autofill suppression when browser autofill is observed
 ```
 
-Aliases `A1` through `A4`, `B1` through `B8`, and `C1` through `C3` map to the scenarios above.
+Aliases `A1` through `A5`, `B1` through `B11`, and `C1` through `C4` map to the scenarios above.
 
 To scan the loaded page and list candidate username, password, and submit selectors without running the full validation:
 
