@@ -2533,25 +2533,30 @@ async function triggerBehaviorScore(page, root, config, options = {}) {
     button.remove();
   };
 
-  if (root && typeof root.evaluate === 'function') {
-    await root.evaluate(createSyntheticSubmit);
-  } else if (root && typeof root.locator === 'function') {
-    await root.locator('body').evaluate((body) => {
-      const button = document.createElement('button');
-      button.type = 'submit';
-      button.id = 'submit';
-      button.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;';
-      body.appendChild(button);
-      button.click();
-      button.remove();
-    });
-  } else {
-    await page.evaluate(createSyntheticSubmit);
+  const submitCount = Number(process.env.INTERACTION_SYNTHETIC_SUBMIT_COUNT || 2);
+  for (let index = 0; index < Math.max(1, submitCount); index += 1) {
+    if (root && typeof root.evaluate === 'function') {
+      await root.evaluate(createSyntheticSubmit);
+    } else if (root && typeof root.locator === 'function') {
+      await root.locator('body').evaluate((body) => {
+        const button = document.createElement('button');
+        button.type = 'submit';
+        button.id = 'submit';
+        button.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;';
+        body.appendChild(button);
+        button.click();
+        button.remove();
+      });
+    } else {
+      await page.evaluate(createSyntheticSubmit);
+    }
+    await page.waitForTimeout(Number(process.env.INTERACTION_SYNTHETIC_SUBMIT_GAP_MS || 250));
   }
 
   await page.waitForTimeout(Number(process.env.INTERACTION_SCORE_WAIT_MS || 750));
   return {
     method: 'synthetic_hidden_submit',
+    submitCount: Math.max(1, submitCount),
     context: root && typeof root.evaluate === 'function' ? 'frame_or_page' : root && typeof root.locator === 'function' ? 'frame_locator' : 'page',
   };
 }
@@ -2572,6 +2577,38 @@ async function readBehaviorState(page) {
     dfs_E_7_score_tokens: scoreState,
     dfs_F_5: f5,
     dfs_F_2: cookies.dfs_F_2 || getFingerprintValue(fingerprint, 'dfs_F_2'),
+  };
+}
+
+async function waitForBehaviorExpectations(page, expectations, baselineState = null) {
+  const timeoutMs = Number(process.env.INTERACTION_SCORE_POLL_TIMEOUT_MS || 5000);
+  const intervalMs = Number(process.env.INTERACTION_SCORE_POLL_INTERVAL_MS || 250);
+  const startedAt = Date.now();
+  const samples = [];
+  let lastState = null;
+  let lastFailures = [];
+
+  do {
+    lastState = await readBehaviorState(page);
+    lastFailures = expectations.length > 0
+      ? getAgenticScoreFailures(lastState.dfs_E_7_score_tokens, expectations, baselineState)
+      : [];
+    samples.push({
+      elapsedMs: Date.now() - startedAt,
+      dfs_E_7: lastState.dfs_E_7,
+      scores: lastState.dfs_E_7_score_tokens && lastState.dfs_E_7_score_tokens.scores,
+      failures: lastFailures,
+    });
+    if (lastFailures.length === 0) break;
+    await page.waitForTimeout(intervalMs);
+  } while (Date.now() - startedAt < timeoutMs);
+
+  return {
+    state: lastState,
+    failures: lastFailures,
+    samples,
+    timeoutMs,
+    intervalMs,
   };
 }
 
@@ -2938,12 +2975,11 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       );
       return;
     }
-    const after = await runStep(`read ${scenarioName} behavior state`, () => readBehaviorState(scenarioPage));
-    const debugLog = await runStep(`read ${scenarioName} dfs_E_5 debug log`, () => getDfsE5DebugLog(scenarioPage));
     const scoreExpectations = getAgenticScoreExpectations(scenarioName);
-    const scoreFailures = scoreExpectations.length > 0
-      ? getAgenticScoreFailures(after.dfs_E_7_score_tokens, scoreExpectations, before.dfs_E_7_score_tokens)
-      : [];
+    const expectationWait = await runStep(`wait for ${scenarioName} behavior expectations`, () => waitForBehaviorExpectations(scenarioPage, scoreExpectations, before.dfs_E_7_score_tokens));
+    const after = expectationWait.state;
+    const debugLog = await runStep(`read ${scenarioName} dfs_E_5 debug log`, () => getDfsE5DebugLog(scenarioPage));
+    const scoreFailures = expectationWait.failures;
     const f2Changed = before.dfs_F_2 !== undefined && after.dfs_F_2 !== undefined && String(before.dfs_F_2) !== String(after.dfs_F_2);
     const failures = [...scoreFailures];
     const evidence = {
@@ -2970,6 +3006,7 @@ async function runInteractionScenario(browser, target, config, outputDir, result
         dfs_F_2: after.dfs_F_2,
       },
       expectations: scoreExpectations,
+      expectationWait,
       assertionMode: 'score-tokens',
       f2Changed,
       trigger: performed.trigger,
@@ -3491,7 +3528,18 @@ async function runTarget(target, config) {
       );
     }
 
-    await runPrivateModeBrowserTest(target, config, outputDir, results);
+    if (readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', true)) {
+      await runPrivateModeBrowserTest(target, config, outputDir, results);
+    } else {
+      addResult(
+        results,
+        'Private / Incognito Browser Mode Launch',
+        'SKIP',
+        { reason: 'PERFORM_PRIVATE_MODE_BROWSER_TEST=false; private/incognito browser launch skipped by configuration before launch.' },
+        [],
+        ['Private/incognito browser mode launch skipped by configuration.']
+      );
+    }
 
     const fingerprintValues = extractFingerprintValues(initialFingerprint);
     const fingerprintValuesText = Object.keys(fingerprintValues).sort().map((key) => `${key}=${fingerprintValues[key]}`).join('\n');

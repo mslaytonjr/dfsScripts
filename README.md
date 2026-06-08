@@ -185,6 +185,8 @@ For `cadence_rigidity`, the runner uses fixed-interval manual key/input events b
 
 For `focus_anomaly`, `dwell_missing_keyups`, and `dwell_short_holds`, the runner mutates field value while dispatching the abnormal focus/key/input sequence and uses synthetic score refresh by default. For `fill_speed`, the runner targets field1 by default so the assertion remains `field1.fillSpeed`.
 
+After each interaction scenario, the runner polls the score-token state until expectations pass or `INTERACTION_SCORE_POLL_TIMEOUT_MS` expires. Synthetic score refresh runs `INTERACTION_SYNTHETIC_SUBMIT_COUNT=2` hidden submit events by default to reduce detector/cookie flush races.
+
 Transient interaction and spoofing-control failures are retried with `TEST_RETRY_ATTEMPTS=3` and `TEST_RETRY_DELAY_MS=3000`. Retries are limited to page-readiness failures such as missing selectors, null/undefined reads, detached frames, destroyed execution contexts, or timeouts; bit assertion mismatches still fail immediately.
 
 Valid numeric `dfs_E_7` score-token interaction scenarios:
