@@ -1,5 +1,8 @@
 node_modules/
 
+# local environment config; use .env.example as the shared template
+.env
+
 # browser profiles written by persistent-context runs
 .profiles/
 
