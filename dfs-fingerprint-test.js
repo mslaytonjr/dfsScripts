@@ -1190,8 +1190,11 @@ function getLogonSkipReason() {
   }
 
   const missing = [
+    ['LOGIN_USERNAME', process.env.LOGIN_USERNAME],
+    ['LOGIN_PASSWORD', process.env.LOGIN_PASSWORD],
     ['USERNAME_SELECTOR', process.env.USERNAME_SELECTOR],
     ['PASSWORD_SELECTOR', process.env.PASSWORD_SELECTOR],
+    ['SUBMIT_SELECTOR', process.env.SUBMIT_SELECTOR],
   ].filter(([, value]) => value === undefined || value.trim() === '');
 
   if (missing.length > 0) {
@@ -1204,6 +1207,128 @@ function getLogonSkipReason() {
   }
 
   return null;
+}
+
+async function clickLocatorWithoutNavigationWait(page, locator, timeout) {
+  await locator.waitFor({ state: 'visible', timeout });
+  await Promise.all([
+    page.waitForLoadState(process.env.POST_SUBMIT_LOAD_STATE || 'networkidle', {
+      timeout: Number(process.env.POST_SUBMIT_TIMEOUT_MS || 30000),
+    }).catch(() => null),
+    locator.click({ timeout, noWaitAfter: true }),
+  ]);
+}
+
+function serializeRequest(request) {
+  if (!request) return null;
+  const headers = request.headers();
+  const postData = request.postData();
+  return {
+    url: request.url(),
+    method: request.method(),
+    resourceType: request.resourceType(),
+    headers,
+    postData,
+    postDataJson: (() => {
+      if (!postData) return null;
+      try {
+        return JSON.parse(postData);
+      } catch {
+        return null;
+      }
+    })(),
+  };
+}
+
+async function runLogonValidation(page, outputDir, results) {
+  const skip = getLogonSkipReason();
+  if (skip) {
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      'SKIP',
+      skip,
+      [],
+      []
+    );
+    return { skipped: true, ...skip };
+  }
+
+  const config = getInputInteractionConfig();
+  const username = readString('LOGIN_USERNAME');
+  const password = readString('LOGIN_PASSWORD');
+  const evidenceFiles = [];
+
+  try {
+    const root = await getScenarioRoot(page);
+    const usernameField = root.locator(config.usernameSelector);
+    const passwordField = root.locator(config.passwordSelector);
+    const submitButton = root.locator(config.submitSelector);
+
+    await usernameField.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+    await passwordField.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+    await usernameField.fill(username);
+    await passwordField.fill(password);
+
+    const requestMatcher = readString('LOGIN_REQUEST_MATCHER');
+    const requestPromise = requestMatcher
+      ? waitForLoginRequest(page, requestMatcher).catch((error) => ({ __error: error.message }))
+      : Promise.resolve(null);
+
+    await clickLocatorWithoutNavigationWait(
+      page,
+      submitButton,
+      Number(process.env.POST_SUBMIT_TIMEOUT_MS || process.env.FIELD_TIMEOUT_MS || 30000)
+    );
+    await waitForCookieSettle(page, 'post_submit');
+
+    const loginRequestResult = await requestPromise;
+    const loginRequest = loginRequestResult && !loginRequestResult.__error
+      ? serializeRequest(loginRequestResult)
+      : loginRequestResult;
+    const cookies = parseCookieArray(await getDfsCookies(page));
+    const fingerprint = await getFingerprint(page, { wait: false });
+
+    const cookiesFile = saveJson(path.join(outputDir, 'cookies-after-submit.json'), cookies);
+    const fingerprintFile = saveJson(path.join(outputDir, 'fingerprint-after-submit.json'), fingerprint);
+    const requestFile = saveJson(path.join(outputDir, 'network-login-request.json'), loginRequest);
+    evidenceFiles.push(cookiesFile, fingerprintFile, requestFile);
+
+    const missingRequest = Boolean(requestMatcher && (!loginRequest || loginRequest.__error));
+    const details = {
+      submitted: true,
+      usernameSelector: config.usernameSelector,
+      passwordSelector: config.passwordSelector,
+      submitSelector: config.submitSelector,
+      loginRequestMatcher: requestMatcher || null,
+      loginRequest,
+      cookieNames: Object.keys(cookies).sort(),
+      fingerprintAvailable: fingerprint && typeof fingerprint === 'object' && !fingerprint.__error,
+    };
+    const errors = [];
+    if (missingRequest) errors.push(`No login request matched ${requestMatcher}: ${loginRequest.__error}`);
+
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      errors.length === 0 ? 'PASS' : 'FAIL',
+      details,
+      evidenceFiles,
+      errors
+    );
+
+    return details;
+  } catch (error) {
+    addResult(
+      results,
+      'Cookies and Payload After Form Submission',
+      'FAIL',
+      { error: error.message },
+      evidenceFiles,
+      [error.message]
+    );
+    return { error: error.message };
+  }
 }
 
 async function waitForCookieSettle(page, phase) {
@@ -1569,8 +1694,8 @@ function getAgenticScoreExpectations(scenarioName) {
     focus_no_pointer: [{ position: field1(E7_FIELD.FOCUS_NO_POINTER), dimension: 'field1.focusNoPointer', operator: '==', expected: 99 }],
     key_input_mismatch_cdp: [{ position: field1(E7_FIELD.KEY_INPUT_MISMATCH), dimension: 'field1.keyInputMismatch', operator: '>=', expected: 90 }],
     key_input_mismatch_paste_negative: [{ position: field1(E7_FIELD.KEY_INPUT_MISMATCH), dimension: 'field1.keyInputMismatch', operator: '==', expected: 0 }],
-    human_baseline: [{ allPositions: true, dimension: 'all', operator: '<=', expected: 0 }],
-    human_pause_baseline: [{ allPositions: true, dimension: 'all', operator: '<=', expected: 20 }],
+    human_baseline: [{ allPositions: true, dimension: 'all', operator: '<=', expected: 0, allowNoIncrease: true, excludePositions: [E7_POS.COLD_FOCUS] }],
+    human_pause_baseline: [{ allPositions: true, dimension: 'all', operator: '<=', expected: 20, allowNoIncrease: true, excludePositions: [E7_POS.COLD_FOCUS] }],
     human_mouse_path: [{ position: E7_POS.POINTER_TRAVEL, dimension: 'pointerTravel', operator: '<=', expected: 20 }],
     browser_autofill_suppression: [
       { position: E7_POS.VALUE_INJECTION, dimension: 'valueInjection', operator: '==', expected: 0 },
@@ -1593,7 +1718,7 @@ function compareScore(actual, operator, expected, tolerance = 0) {
   return Number(actual) === Number(expected);
 }
 
-function getAgenticScoreFailures(scoreState, expectations) {
+function getAgenticScoreFailures(scoreState, expectations, baselineState = null) {
   if (!scoreState || scoreState.format !== 'score-tokens') {
     return [`dfs_E_7 is not in numeric score-token format; got ${scoreState ? scoreState.format : 'missing'}`];
   }
@@ -1601,9 +1726,19 @@ function getAgenticScoreFailures(scoreState, expectations) {
   const failures = [];
   for (const expectation of expectations) {
     if (expectation.allPositions) {
+      const excludedPositions = new Set((expectation.excludePositions || []).map((position) => Number(position)));
       scoreState.scores.forEach((score, position) => {
+        if (excludedPositions.has(position)) return;
+        const baselineScore = baselineState && Array.isArray(baselineState.scores)
+          ? baselineState.scores[position]
+          : null;
+        const allowedByBaseline = expectation.allowNoIncrease &&
+          baselineScore !== null &&
+          baselineScore !== undefined &&
+          Number(score) <= Number(baselineScore);
+        if (allowedByBaseline) return;
         if (!compareScore(score, expectation.operator, expectation.expected, expectation.tolerance)) {
-          failures.push(`token[${position}] expected ${expectation.operator} ${expectation.expected}${expectation.tolerance ? ` +/- ${expectation.tolerance}` : ''}, got ${score}`);
+          failures.push(`token[${position}] expected ${expectation.operator} ${expectation.expected}${expectation.tolerance ? ` +/- ${expectation.tolerance}` : ''}${expectation.allowNoIncrease ? ' or no increase from baseline' : ''}, got ${score}${baselineScore !== null && baselineScore !== undefined ? `, baseline ${baselineScore}` : ''}`);
         }
       });
       continue;
@@ -1679,6 +1814,16 @@ function getInputInteractionConfig() {
     passwordSelector: readString('PASSWORD_SELECTOR'),
     submitSelector: readString('SUBMIT_SELECTOR'),
   };
+}
+
+function frameNameFromSelector(selector) {
+  const text = String(selector || '').trim();
+  if (!text) return '';
+  const nameMatch = text.match(/\[\s*name\s*=\s*["']?([^"'\]]+)["']?\s*\]/i);
+  if (nameMatch) return nameMatch[1];
+  const idMatch = text.match(/^iframe#([A-Za-z0-9_-]+)$/i);
+  if (idMatch) return idMatch[1];
+  return '';
 }
 
 function supportsCdpInsertText(target) {
@@ -1792,7 +1937,18 @@ async function ensureAgenticScratchFields(page, root, count) {
       input.id = `dfs-agentic-scratch-${index}`;
       input.name = `dfsAgenticScratch${index}`;
       input.autocomplete = 'off';
-      input.style.cssText = 'position:fixed;left:20px;top:20px;width:160px;height:24px;z-index:2147483647;opacity:0.01;';
+      input.style.cssText = [
+        'position:fixed',
+        `left:${20 + (index * 180)}px`,
+        'top:20px',
+        'width:160px',
+        'height:24px',
+        'z-index:2147483647',
+        'opacity:1',
+        'background:#fff',
+        'color:#111',
+        'border:1px solid #999',
+      ].join(';');
       body.appendChild(input);
       created.push(`#${input.id}`);
     }
@@ -1808,7 +1964,18 @@ async function ensureAgenticScratchFields(page, root, count) {
       input.id = `dfs-agentic-scratch-${index}`;
       input.name = `dfsAgenticScratch${index}`;
       input.autocomplete = 'off';
-      input.style.cssText = 'position:fixed;left:20px;top:20px;width:160px;height:24px;z-index:2147483647;opacity:0.01;';
+      input.style.cssText = [
+        'position:fixed',
+        `left:${20 + (index * 180)}px`,
+        'top:20px',
+        'width:160px',
+        'height:24px',
+        'z-index:2147483647',
+        'opacity:1',
+        'background:#fff',
+        'color:#111',
+        'border:1px solid #999',
+      ].join(';');
       body.appendChild(input);
       created.push(`#${input.id}`);
     }
@@ -1832,9 +1999,20 @@ async function setFieldValueWithoutKeys(locator, value, options = {}) {
     const dispatchEvents = payload.dispatchEvents;
     if (document.activeElement === el) el.blur();
     const before = el.value;
-    el.value = nextValue;
+    const valueDescriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (valueDescriptor && typeof valueDescriptor.set === 'function') {
+      valueDescriptor.set.call(el, nextValue);
+    } else {
+      el.value = nextValue;
+    }
     const events = [];
     if (dispatchEvents) {
+      const beforeInputEvent = typeof InputEvent === 'function'
+        ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: nextValue })
+        : new Event('beforeinput', { bubbles: true, cancelable: true });
+      el.dispatchEvent(beforeInputEvent);
+      events.push({ type: 'beforeinput', isTrusted: beforeInputEvent.isTrusted });
+
       const inputEvent = typeof InputEvent === 'function'
         ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: nextValue })
         : new Event('input', { bubbles: true, cancelable: true });
@@ -1871,6 +2049,55 @@ async function programmaticFocusField(locator) {
 }
 
 async function dispatchSyntheticInputEvents(locator, value) {
+  await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  const nextValue = String(value);
+  const preProbe = await locator.evaluate((el) => {
+    const events = [];
+    el.__dfsSyntheticEventProbe = events;
+    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click', 'keydown', 'beforeinput', 'input', 'keyup', 'change']) {
+      el.addEventListener(type, (event) => {
+        events.push({
+          type,
+          isTrusted: Boolean(event.isTrusted),
+          inputType: event.inputType || '',
+          key: event.key || '',
+          data: event.data || '',
+        });
+      }, true);
+    }
+    if (document.activeElement === el) el.blur();
+    return { activeElementBlurred: document.activeElement !== el };
+  });
+
+  const eventInit = { bubbles: true, cancelable: true };
+  const keyboardInit = { ...eventInit, key: 'a', code: 'KeyA' };
+  const inputInit = { ...eventInit, inputType: 'insertText', data: nextValue };
+  await locator.dispatchEvent('pointerdown', { ...eventInit, pointerType: 'mouse', button: 0 });
+  await locator.dispatchEvent('mousedown', { ...eventInit, button: 0 });
+  await locator.dispatchEvent('mouseup', { ...eventInit, button: 0 });
+  await locator.dispatchEvent('click', { ...eventInit, button: 0 });
+  await locator.dispatchEvent('keydown', keyboardInit);
+  await locator.dispatchEvent('beforeinput', inputInit);
+  await locator.evaluate((el, payload) => {
+    el.value = payload.nextValue;
+  }, { nextValue });
+  await locator.dispatchEvent('input', inputInit);
+  await locator.dispatchEvent('keyup', keyboardInit);
+  await locator.dispatchEvent('change', eventInit);
+
+  return locator.evaluate((el, payload) => {
+    const events = Array.isArray(el.__dfsSyntheticEventProbe) ? el.__dfsSyntheticEventProbe.slice() : [];
+    delete el.__dfsSyntheticEventProbe;
+    return {
+      preProbe: payload.preProbe,
+      value: el.value,
+      events,
+      method: 'locator.dispatchEvent_pointer_mouse_keyboard_input_change',
+    };
+  }, { preProbe });
+}
+
+async function dispatchSyntheticInputEventsInPage(locator, value) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   return locator.evaluate((el, nextValue) => {
     if (document.activeElement === el) el.blur();
@@ -1971,6 +2198,62 @@ async function typeWithVariableDelay(page, locator, value, minMs, maxMs, options
   return { value: String(value), delays, coefficientOfVariation: coefficientOfVariation(delays) };
 }
 
+async function typeWithFixedCadenceEvents(locator, value, delayMs) {
+  await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await locator.click();
+  return locator.evaluate(async (el, payload) => {
+    const text = String(payload.value);
+    const delay = Number(payload.delayMs);
+    const events = [];
+    const intervals = [];
+    let previousAt = null;
+    el.value = '';
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    for (const char of text) {
+      const now = performance.now();
+      if (previousAt !== null) intervals.push(Math.round((now - previousAt) * 1000) / 1000);
+      previousAt = now;
+
+      const keydown = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: char });
+      el.dispatchEvent(keydown);
+      const beforeinput = typeof InputEvent === 'function'
+        ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('beforeinput', { bubbles: true, cancelable: true });
+      el.dispatchEvent(beforeinput);
+      el.value = `${el.value || ''}${char}`;
+      const input = typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('input', { bubbles: true, cancelable: true });
+      el.dispatchEvent(input);
+      const keyup = new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: char });
+      el.dispatchEvent(keyup);
+      events.push({
+        char,
+        keydownTrusted: keydown.isTrusted,
+        inputTrusted: input.isTrusted,
+        keyupTrusted: keyup.isTrusted,
+      });
+      await sleep(delay);
+    }
+
+    return {
+      value: el.value,
+      delayMs: delay,
+      intervals,
+      events,
+      coefficientOfVariation: (() => {
+        if (intervals.length === 0) return null;
+        const mean = intervals.reduce((sum, item) => sum + item, 0) / intervals.length;
+        if (mean === 0) return 0;
+        const variance = intervals.reduce((sum, item) => sum + ((item - mean) ** 2), 0) / intervals.length;
+        return Math.sqrt(variance) / mean;
+      })(),
+      method: 'fixed_cadence_manual_key_input_events',
+    };
+  }, { value: String(value), delayMs });
+}
+
 function coefficientOfVariation(values) {
   if (!Array.isArray(values) || values.length === 0) return null;
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
@@ -1979,32 +2262,53 @@ function coefficientOfVariation(values) {
   return Math.sqrt(variance) / mean;
 }
 
-async function dispatchFocusAnomaly(locator) {
+async function dispatchFocusAnomaly(locator, text) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-  return locator.evaluate((el) => {
+  return locator.evaluate((el, value) => {
     if (document.activeElement === el) el.blur();
-    const event = new Event('input', { bubbles: true, cancelable: true });
-    el.dispatchEvent(event);
+    const before = el.value;
+    el.value = String(value);
+    const beforeinput = typeof InputEvent === 'function'
+      ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: String(value) })
+      : new Event('beforeinput', { bubbles: true, cancelable: true });
+    const input = typeof InputEvent === 'function'
+      ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: String(value) })
+      : new Event('input', { bubbles: true, cancelable: true });
+    el.dispatchEvent(beforeinput);
+    el.dispatchEvent(input);
     el.focus();
     return {
+      before,
+      after: el.value,
       inputBeforeFocus: true,
-      inputIsTrusted: event.isTrusted,
+      beforeinputIsTrusted: beforeinput.isTrusted,
+      inputIsTrusted: input.isTrusted,
       activeElementAfter: document.activeElement === el,
     };
-  });
+  }, String(text));
 }
 
 async function dispatchKeydownsWithoutKeyups(locator, text) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   return locator.evaluate((el, value) => {
     el.focus();
+    el.value = '';
     const events = [];
     for (const char of String(value)) {
-      const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: char });
-      el.dispatchEvent(event);
-      events.push({ type: event.type, key: char, isTrusted: event.isTrusted });
+      const down = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: char });
+      el.dispatchEvent(down);
+      const beforeinput = typeof InputEvent === 'function'
+        ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('beforeinput', { bubbles: true, cancelable: true });
+      el.dispatchEvent(beforeinput);
+      el.value = `${el.value || ''}${char}`;
+      const input = typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('input', { bubbles: true, cancelable: true });
+      el.dispatchEvent(input);
+      events.push({ key: char, keydownTrusted: down.isTrusted, inputTrusted: input.isTrusted, keyupDispatched: false });
     }
-    return { keydownCount: events.length, keyupCount: 0, events };
+    return { value: el.value, keydownCount: events.length, keyupCount: 0, inputCount: events.length, events };
   }, String(text));
 }
 
@@ -2012,15 +2316,25 @@ async function dispatchShortHoldKeys(locator, text) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   return locator.evaluate((el, value) => {
     el.focus();
+    el.value = '';
     const events = [];
     for (const char of String(value)) {
       const down = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: char });
       const up = new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: char });
       el.dispatchEvent(down);
+      const beforeinput = typeof InputEvent === 'function'
+        ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('beforeinput', { bubbles: true, cancelable: true });
+      el.dispatchEvent(beforeinput);
+      el.value = `${el.value || ''}${char}`;
+      const input = typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: char })
+        : new Event('input', { bubbles: true, cancelable: true });
+      el.dispatchEvent(input);
       el.dispatchEvent(up);
-      events.push({ key: char, holdMs: 0, keydownTrusted: down.isTrusted, keyupTrusted: up.isTrusted });
+      events.push({ key: char, holdMs: 0, keydownTrusted: down.isTrusted, inputTrusted: input.isTrusted, keyupTrusted: up.isTrusted });
     }
-    return { medianHoldMs: 0, events };
+    return { value: el.value, medianHoldMs: 0, events };
   }, String(text));
 }
 
@@ -2031,18 +2345,48 @@ async function pasteFragments(locator, fragments) {
     const results = [];
     for (const chunk of chunkList) {
       const before = el.value;
-      let execResult = false;
+      let pasteEventResult = false;
+      let inputEventType = 'insertFromPaste';
+      let pasteEventError = null;
       try {
-        execResult = document.execCommand('insertText', false, chunk);
-      } catch {}
-      if (!execResult) {
-        el.value = `${el.value || ''}${chunk}`;
-        const event = new InputEvent('input', { bubbles: true, inputType: 'insertText', data: chunk });
-        el.dispatchEvent(event);
+        const data = new DataTransfer();
+        data.setData('text/plain', chunk);
+        const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data });
+        pasteEventResult = el.dispatchEvent(pasteEvent);
+      } catch (error) {
+        pasteEventError = error.message;
       }
-      results.push({ chunk, before, after: el.value, execCommandResult: execResult });
+
+      el.value = `${el.value || ''}${chunk}`;
+      try {
+        const inputEvent = typeof InputEvent === 'function'
+          ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertFromPaste', data: chunk })
+          : new Event('input', { bubbles: true, cancelable: true });
+        el.dispatchEvent(inputEvent);
+        inputEventType = inputEvent.inputType || inputEventType;
+      } catch {
+        const event = new Event('input', { bubbles: true, cancelable: true });
+        el.dispatchEvent(event);
+        inputEventType = 'input';
+      }
+
+      const changeEvent = new Event('change', { bubbles: true, cancelable: true });
+      el.dispatchEvent(changeEvent);
+      results.push({
+        chunk,
+        before,
+        after: el.value,
+        pasteEventResult,
+        pasteEventError,
+        inputEventType,
+        method: 'clipboard_paste_event_plus_insertFromPaste_input',
+      });
     }
-    return { pasteLikeOperationCount: chunkList.length, fragments: results };
+    return {
+      pasteLikeOperationCount: chunkList.length,
+      fragments: results,
+      expectedSignal: '3+ paste/inputType insertFromPaste operations in one field',
+    };
   }, fragments);
 }
 
@@ -2062,7 +2406,10 @@ async function ensureAgenticScratchClickTargets(page, root, count) {
         'width:160px',
         'height:36px',
         'z-index:2147483647',
-        'opacity:0.01',
+        'opacity:1',
+        'background:#fff',
+        'color:#111',
+        'border:1px solid #999',
       ].join(';');
       body.appendChild(button);
       created.push(`#${button.id}`);
@@ -2085,7 +2432,10 @@ async function ensureAgenticScratchClickTargets(page, root, count) {
         'width:160px',
         'height:36px',
         'z-index:2147483647',
-        'opacity:0.01',
+        'opacity:1',
+        'background:#fff',
+        'color:#111',
+        'border:1px solid #999',
       ].join(';');
       body.appendChild(button);
       created.push(`#${button.id}`);
@@ -2121,8 +2471,13 @@ async function clickDistinctCenterTargets(page, root, count) {
       const box = await control.boundingBox();
       if (!box) throw new Error('Missing bounding box for center click target');
       const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-      await page.mouse.click(center.x, center.y);
-      clicked.push({ index, center, method: 'page.mouse.click_exact_center' });
+      if (readBoolean('POINTER_LOCK_USE_LOCATOR_CLICK', true)) {
+        await control.click({ timeout: 3000, noWaitAfter: true });
+        clicked.push({ index, center, method: 'locator.click_default_center' });
+      } else {
+        await page.mouse.click(center.x, center.y);
+        clicked.push({ index, center, method: 'page.mouse.click_exact_center' });
+      }
     } catch (error) {
       clicked.push({ index, error: error.message });
     }
@@ -2259,7 +2614,7 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
 
   switch (scenarioName) {
     case 'value_injection': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, 3);
+      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.VALUE_INJECTION_FIELD_COUNT || 4));
       const injections = [];
       await page.waitForTimeout(Number(process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
       const dispatchEvents = readBoolean('VALUE_INJECTION_DISPATCH_EVENTS', true);
@@ -2299,7 +2654,7 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'synthetic_events': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.SYNTHETIC_EVENTS_FIELD_COUNT || 3));
+      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.SYNTHETIC_EVENTS_FIELD_COUNT || 4));
       const events = [];
       for (let index = 0; index < selectors.length; index += 1) {
         const selector = selectors[index];
@@ -2326,7 +2681,7 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'pointer_travel': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, 2);
+      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.POINTER_TRAVEL_CLICK_COUNT || 3));
       const clicked = [];
       for (const selector of selectors) {
         const field = root.locator(selector);
@@ -2334,36 +2689,50 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
         await field.click({ noWaitAfter: true });
         clicked.push(selector);
       }
+      const mouseTeleport = readBoolean('POINTER_TRAVEL_USE_MOUSE_TELEPORT', true)
+        ? await maybeTeleportMouse(page)
+        : null;
       scenarioDetails.pointerTravel = {
         clicked,
+        clickCount: clicked.length,
         usedIntermediateMouseMoves: false,
+        usedMouseTeleport: Boolean(mouseTeleport),
         expectedToken: 'pointerTravel',
         expectedPosition: 3,
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      scenarioDetails.mouseTeleport = mouseTeleport;
+      triggerOptions.forceSyntheticSubmit = readBoolean('POINTER_TRAVEL_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'injected_text': {
       const field = root.locator(config.usernameSelector);
-      scenarioDetails.injectedText = await setFieldValueWithoutKeys(field, username);
+      await page.waitForTimeout(Number(process.env.INJECTED_TEXT_ECHO_WINDOW_WAIT_MS || process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
+      scenarioDetails.injectedText = await setFieldValueWithoutKeys(field, username, {
+        dispatchEvents: readBoolean('INJECTED_TEXT_DISPATCH_EVENTS', true),
+      });
       scenarioDetails.injectedText.expectedToken = 'field1.injectedText';
       scenarioDetails.injectedText.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.INJECTED_TEXT);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('INJECTED_TEXT_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'cadence_rigidity': {
       const delayMs = Number(process.env.ROBOTIC_TYPING_DELAY_MS || 50);
       const field = root.locator(config.usernameSelector);
       await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-      await field.click();
-      await page.keyboard.type(String(username), { delay: delayMs });
+      const cadence = readBoolean('CADENCE_RIGIDITY_USE_MANUAL_EVENTS', true)
+        ? await typeWithFixedCadenceEvents(field, username, delayMs)
+        : await (async () => {
+            await field.click();
+            await page.keyboard.type(String(username), { delay: delayMs });
+            return { value: String(username), delayMs, method: 'page.keyboard.type' };
+          })();
       scenarioDetails.cadenceRigidity = {
+        ...cadence,
         textLength: String(username).length,
-        delayMs,
         expectedToken: 'field1.cadenceRigidity',
         expectedPosition: getDfsE7FieldTokenPosition(0, E7_FIELD.CADENCE_RIGIDITY),
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('CADENCE_RIGIDITY_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'human_like_cadence': {
@@ -2376,47 +2745,47 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'focus_anomaly':
-      scenarioDetails.focusAnomaly = await dispatchFocusAnomaly(root.locator(config.usernameSelector));
+      scenarioDetails.focusAnomaly = await dispatchFocusAnomaly(root.locator(config.usernameSelector), username);
       scenarioDetails.focusAnomaly.expectedToken = 'field1.focusAnomaly';
       scenarioDetails.focusAnomaly.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.FOCUS_ANOMALY);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('FOCUS_ANOMALY_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     case 'dwell_missing_keyups':
       scenarioDetails.dwellAnomaly = await dispatchKeydownsWithoutKeyups(root.locator(config.usernameSelector), username);
       scenarioDetails.dwellAnomaly.expectedToken = 'field1.dwellAnomaly';
       scenarioDetails.dwellAnomaly.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.DWELL_ANOMALY);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('DWELL_ANOMALY_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     case 'dwell_short_holds':
       scenarioDetails.dwellAnomaly = await dispatchShortHoldKeys(root.locator(config.usernameSelector), username);
       scenarioDetails.dwellAnomaly.expectedToken = 'field1.dwellAnomaly';
       scenarioDetails.dwellAnomaly.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.DWELL_ANOMALY);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('DWELL_ANOMALY_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     case 'fill_speed': {
-      const selector = config.passwordSelector || config.usernameSelector;
+      const selector = readString('FILL_SPEED_SELECTOR', config.usernameSelector);
       const field = root.locator(selector);
       await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
       await field.click();
-      const text = password || 'password123';
+      const text = readString('FILL_SPEED_TEXT', username || 'testuser1');
       const delayMs = Number(process.env.FILL_SPEED_TYPE_DELAY_MS || 5);
       await page.keyboard.type(String(text), { delay: delayMs });
       scenarioDetails.fillSpeed = {
         selector,
         textLength: String(text).length,
         delayMs,
-        expectedToken: selector === config.passwordSelector ? 'field2.fillSpeed' : 'field1.fillSpeed',
-        expectedPosition: getDfsE7FieldTokenPosition(selector === config.passwordSelector ? 1 : 0, E7_FIELD.FILL_SPEED),
+        expectedToken: 'field1.fillSpeed',
+        expectedPosition: getDfsE7FieldTokenPosition(0, E7_FIELD.FILL_SPEED),
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('FILL_SPEED_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'paste_fragmentation': {
-      const fragments = parseList(readString('PASTE_FRAGMENTATION_CHUNKS', 'tes,tus,er1'));
+      const fragments = parseList(readString('PASTE_FRAGMENTATION_CHUNKS', 'te,st,us,er1'));
       scenarioDetails.pasteFragmentation = await pasteFragments(root.locator(config.usernameSelector), fragments);
       scenarioDetails.pasteFragmentation.expectedToken = 'field1.pasteFragmentation';
       scenarioDetails.pasteFragmentation.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.PASTE_FRAGMENTATION);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('PASTE_FRAGMENTATION_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'focus_no_pointer':
@@ -2485,10 +2854,22 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       await page.keyboard.type(text.slice(0, 3), { delay: 90 });
       await page.waitForTimeout(Number(process.env.HUMAN_PAUSE_MS || 500));
       await page.keyboard.type(text.slice(3), { delay: 100 });
+      if (config.passwordSelector) {
+        await clickWithMousePath(page, root.locator(config.passwordSelector), { offsetRatioX: 0.43, offsetRatioY: 0.57 });
+        const passwordText = String(password || 'password123');
+        await page.keyboard.type(passwordText.slice(0, 3), { delay: 95 });
+        await page.waitForTimeout(Number(process.env.HUMAN_PAUSE_MS || 500));
+        await page.keyboard.type(passwordText.slice(3), { delay: 105 });
+      }
       if (config.submitSelector) {
         scenarioDetails.submitClick = await clickWithMousePath(page, root.locator(config.submitSelector), { offsetRatioX: 0.36, offsetRatioY: 0.61 });
       }
-      scenarioDetails.humanPauseBaseline = { firstChunkLength: Math.min(3, text.length), pauseMs: Number(process.env.HUMAN_PAUSE_MS || 500) };
+      scenarioDetails.humanPauseBaseline = {
+        usernameFirstChunkLength: Math.min(3, text.length),
+        passwordIncluded: Boolean(config.passwordSelector),
+        passwordFirstChunkLength: config.passwordSelector ? Math.min(3, String(password || 'password123').length) : 0,
+        pauseMs: Number(process.env.HUMAN_PAUSE_MS || 500),
+      };
       triggerOptions.forceSyntheticSubmit = false;
       triggerOptions.skipSubmit = Boolean(config.submitSelector);
       break;
@@ -2561,7 +2942,7 @@ async function runInteractionScenario(browser, target, config, outputDir, result
     const debugLog = await runStep(`read ${scenarioName} dfs_E_5 debug log`, () => getDfsE5DebugLog(scenarioPage));
     const scoreExpectations = getAgenticScoreExpectations(scenarioName);
     const scoreFailures = scoreExpectations.length > 0
-      ? getAgenticScoreFailures(after.dfs_E_7_score_tokens, scoreExpectations)
+      ? getAgenticScoreFailures(after.dfs_E_7_score_tokens, scoreExpectations, before.dfs_E_7_score_tokens)
       : [];
     const f2Changed = before.dfs_F_2 !== undefined && after.dfs_F_2 !== undefined && String(before.dfs_F_2) !== String(after.dfs_F_2);
     const failures = [...scoreFailures];

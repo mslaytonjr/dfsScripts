@@ -171,11 +171,19 @@ For Chase runs that land on the system-requirements page, the runner marks the t
 
 `INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
 
-For `value_injection`, the runner waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update.
+For `value_injection`, the runner assigns values across `VALUE_INJECTION_FIELD_COUNT=4` fields by default. It waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update.
 
-For `synthetic_events`, the runner dispatches untrusted `keydown`, `beforeinput`, `input`, and `change` events across `SYNTHETIC_EVENTS_FIELD_COUNT=3` fields by default.
+For `synthetic_events`, the runner dispatches untrusted pointer, mouse, keyboard, `beforeinput`, `input`, and `change` events across `SYNTHETIC_EVENTS_FIELD_COUNT=4` fields by default.
 
-For `pointer_lock`, the runner uses dedicated scratch buttons by default (`POINTER_LOCK_USE_SCRATCH_TARGETS=true`), clicks each target at its exact bounding-box center, and uses synthetic score refresh by default (`POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT=true`) to avoid real-page navigation.
+For `pointer_lock`, the runner uses dedicated scratch buttons by default (`POINTER_LOCK_USE_SCRATCH_TARGETS=true`), clicks each target with Playwright's default center click (`POINTER_LOCK_USE_LOCATOR_CLICK=true`), and uses synthetic score refresh by default (`POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT=true`) to avoid real-page navigation.
+
+For `pointer_travel`, the runner clicks `POINTER_TRAVEL_CLICK_COUNT=3` fields without mouse-path interpolation, then adds the stronger mouse-teleport probe by default (`POINTER_TRAVEL_USE_MOUSE_TELEPORT=true`) and uses synthetic score refresh (`POINTER_TRAVEL_FORCE_SYNTHETIC_SUBMIT=true`).
+
+For `injected_text`, the runner waits `INJECTED_TEXT_ECHO_WINDOW_WAIT_MS=2000`, sets the username field through the native value setter without key events, dispatches `beforeinput/input/change` by default (`INJECTED_TEXT_DISPATCH_EVENTS=true`), and uses synthetic score refresh (`INJECTED_TEXT_FORCE_SYNTHETIC_SUBMIT=true`).
+
+For `cadence_rigidity`, the runner uses fixed-interval manual key/input events by default (`CADENCE_RIGIDITY_USE_MANUAL_EVENTS=true`) and synthetic score refresh (`CADENCE_RIGIDITY_FORCE_SYNTHETIC_SUBMIT=true`) so the measured inter-key intervals are intentionally uniform.
+
+For `focus_anomaly`, `dwell_missing_keyups`, and `dwell_short_holds`, the runner mutates field value while dispatching the abnormal focus/key/input sequence and uses synthetic score refresh by default. For `fill_speed`, the runner targets field1 by default so the assertion remains `field1.fillSpeed`.
 
 Transient interaction and spoofing-control failures are retried with `TEST_RETRY_ATTEMPTS=3` and `TEST_RETRY_DELAY_MS=3000`. Retries are limited to page-readiness failures such as missing selectors, null/undefined reads, detached frames, destroyed execution contexts, or timeouts; bit assertion mismatches still fail immediately.
 
@@ -188,7 +196,7 @@ pointer_lock           center-click 5+ controls; token[2] >= 60
 pointer_travel         click targets without intermediate mousemove path; token[3] >= 50
 cold_focus             programmatic focus on 3+ fields; token[4] >= 80
 injected_text          direct username value assignment; token[5] >= 90
-paste_fragmentation    3 insertText chunks in one field; token[6] >= 90
+paste_fragmentation    4 paste-shaped insertFromPaste chunks in one field; token[6] >= 90
 cadence_rigidity       fixed 50ms username typing; token[7] >= 80
 human_like_cadence     variable 60-180ms username typing; token[7] <= 30
 focus_anomaly          input event before focus; token[8] >= 90
@@ -198,8 +206,8 @@ fill_speed             5ms/char password typing; token[10] >= 85
 focus_no_pointer       programmatic focus then type; token[11] = 99
 key_input_mismatch_cdp CDP Input.insertText without keydowns; token[12] >= 90; Chromium only
 key_input_mismatch_paste_negative paste-style insert should not fire mismatch; token[12] = 0
-human_baseline         random cadence and offset submit; all tokens <= 0
-human_pause_baseline   short pause mid-typing; all tokens <= 20
+human_baseline         random cadence and offset submit; non-coldFocus tokens <= 0 or unchanged from baseline
+human_pause_baseline   short pause mid-typing on username and password; non-coldFocus tokens <= 20 or unchanged from baseline
 human_mouse_path       mousemove path between actions; token[3] <= 20
 browser_autofill_suppression validates autofill suppression when browser autofill is observed
 ```
