@@ -171,6 +171,12 @@ For Chase runs that land on the system-requirements page, the runner marks the t
 
 `INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
 
+For `value_injection`, the runner waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update.
+
+For `synthetic_events`, the runner dispatches untrusted `keydown`, `beforeinput`, `input`, and `change` events across `SYNTHETIC_EVENTS_FIELD_COUNT=3` fields by default.
+
+For `pointer_lock`, the runner uses dedicated scratch buttons by default (`POINTER_LOCK_USE_SCRATCH_TARGETS=true`), clicks each target at its exact bounding-box center, and uses synthetic score refresh by default (`POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT=true`) to avoid real-page navigation.
+
 Transient interaction and spoofing-control failures are retried with `TEST_RETRY_ATTEMPTS=3` and `TEST_RETRY_DELAY_MS=3000`. Retries are limited to page-readiness failures such as missing selectors, null/undefined reads, detached frames, destroyed execution contexts, or timeouts; bit assertion mismatches still fail immediately.
 
 Valid numeric `dfs_E_7` score-token interaction scenarios:
@@ -442,7 +448,7 @@ evidence/<releaseversion>/summary-report.json
 - Optional mouse movement and `dfs_F_2` comparison
 - `dfs_F_1` stability across reload
 - Optional login request capture and header/payload comparisons
-- `dfs_E_8` comparison to `RELEASE_VERSION` or `EXPECTED_DFS_E_8`
+- `dfs_E_8` exact-string comparison to `RELEASE_VERSION` or `EXPECTED_DFS_E_8`; commas are treated as literal characters
 
 The runner continues through all tests and all configured browser paths even when a test fails. Each result includes:
 

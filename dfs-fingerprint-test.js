@@ -1825,19 +1825,37 @@ async function getScenarioFieldSelectors(page, root, config, minimumCount = 1) {
   return selectors;
 }
 
-async function setFieldValueWithoutKeys(locator, value) {
+async function setFieldValueWithoutKeys(locator, value, options = {}) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
-  return locator.evaluate((el, nextValue) => {
+  return locator.evaluate((el, payload) => {
+    const nextValue = payload.nextValue;
+    const dispatchEvents = payload.dispatchEvents;
     if (document.activeElement === el) el.blur();
     const before = el.value;
     el.value = nextValue;
+    const events = [];
+    if (dispatchEvents) {
+      const inputEvent = typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertReplacementText', data: nextValue })
+        : new Event('input', { bubbles: true, cancelable: true });
+      el.dispatchEvent(inputEvent);
+      events.push({ type: 'input', isTrusted: inputEvent.isTrusted });
+
+      const changeEvent = new Event('change', { bubbles: true, cancelable: true });
+      el.dispatchEvent(changeEvent);
+      events.push({ type: 'change', isTrusted: changeEvent.isTrusted });
+    }
     return {
       before,
       after: el.value,
+      events,
       keydownCount: 0,
       method: 'direct_el_value_assignment',
     };
-  }, String(value));
+  }, {
+    nextValue: String(value),
+    dispatchEvents: options.dispatchEvents !== false,
+  });
 }
 
 async function programmaticFocusField(locator) {
@@ -1855,13 +1873,29 @@ async function programmaticFocusField(locator) {
 async function dispatchSyntheticInputEvents(locator, value) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   return locator.evaluate((el, nextValue) => {
+    if (document.activeElement === el) el.blur();
     el.value = nextValue;
-    const events = ['input', 'change'].map((type) => {
-      const event = new Event(type, { bubbles: true, cancelable: true });
+    const events = [];
+    const eventSpecs = [
+      ['keydown', () => new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'a', code: 'KeyA' })],
+      ['beforeinput', () => typeof InputEvent === 'function'
+        ? new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: nextValue })
+        : new Event('beforeinput', { bubbles: true, cancelable: true })],
+      ['input', () => typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: nextValue })
+        : new Event('input', { bubbles: true, cancelable: true })],
+      ['change', () => new Event('change', { bubbles: true, cancelable: true })],
+    ];
+    for (const [type, createEvent] of eventSpecs) {
+      const event = createEvent();
       el.dispatchEvent(event);
-      return { type, isTrusted: event.isTrusted };
-    });
-    return { value: el.value, events };
+      events.push({ type, isTrusted: event.isTrusted });
+    }
+    return {
+      value: el.value,
+      events,
+      method: 'manual_dispatchEvent_keyboard_input_change',
+    };
   }, String(value));
 }
 
@@ -2012,23 +2046,88 @@ async function pasteFragments(locator, fragments) {
   }, fragments);
 }
 
-async function clickDistinctCenterTargets(root, count) {
-  const selector = 'button,a,input[type="button"],input[type="submit"],[role="button"]';
-  const controls = root.locator(selector);
-  const total = await controls.count().catch(() => 0);
+async function ensureAgenticScratchClickTargets(page, root, count) {
+  const createTargets = (requiredCount) => {
+    const body = document.body;
+    const created = [];
+    for (let index = 0; index < requiredCount; index += 1) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.id = `dfs-agentic-click-target-${index}`;
+      button.textContent = `DFS Target ${index + 1}`;
+      button.style.cssText = [
+        'position:fixed',
+        `left:${20 + (index * 190)}px`,
+        'top:70px',
+        'width:160px',
+        'height:36px',
+        'z-index:2147483647',
+        'opacity:0.01',
+      ].join(';');
+      body.appendChild(button);
+      created.push(`#${button.id}`);
+    }
+    return created;
+  };
+
+  if (root && typeof root.evaluate === 'function') return root.evaluate(createTargets, count);
+  if (root && typeof root.locator === 'function') return root.locator('body').evaluate((body, requiredCount) => {
+    const created = [];
+    for (let index = 0; index < requiredCount; index += 1) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.id = `dfs-agentic-click-target-${index}`;
+      button.textContent = `DFS Target ${index + 1}`;
+      button.style.cssText = [
+        'position:fixed',
+        `left:${20 + (index * 190)}px`,
+        'top:70px',
+        'width:160px',
+        'height:36px',
+        'z-index:2147483647',
+        'opacity:0.01',
+      ].join(';');
+      body.appendChild(button);
+      created.push(`#${button.id}`);
+    }
+    return created;
+  }, count);
+  return page.evaluate(createTargets, count);
+}
+
+async function clickDistinctCenterTargets(page, root, count) {
+  let selector = 'button,a,input[type="button"],input[type="submit"],[role="button"]';
+  const useScratchTargets = readBoolean('POINTER_LOCK_USE_SCRATCH_TARGETS', true);
+  let total = 0;
+
+  if (useScratchTargets) {
+    const scratchSelectors = await ensureAgenticScratchClickTargets(page, root, count);
+    selector = scratchSelectors.join(',');
+  } else {
+    const controls = root.locator(selector);
+    total = await controls.count().catch(() => 0);
+  }
+
+  if (!useScratchTargets && total < count) {
+    await ensureAgenticScratchClickTargets(page, root, count - total);
+  }
+  const refreshedControls = root.locator(selector);
+  const refreshedTotal = await refreshedControls.count().catch(() => 0);
   const clicked = [];
-  for (let index = 0; index < Math.min(total, count); index += 1) {
-    const control = controls.nth(index);
+  for (let index = 0; index < Math.min(refreshedTotal, count); index += 1) {
+    const control = refreshedControls.nth(index);
     try {
       await control.waitFor({ state: 'visible', timeout: 3000 });
       const box = await control.boundingBox();
-      await control.click({ timeout: 3000, noWaitAfter: true });
-      clicked.push({ index, center: box ? { x: box.x + box.width / 2, y: box.y + box.height / 2 } : null });
+      if (!box) throw new Error('Missing bounding box for center click target');
+      const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      await page.mouse.click(center.x, center.y);
+      clicked.push({ index, center, method: 'page.mouse.click_exact_center' });
     } catch (error) {
       clicked.push({ index, error: error.message });
     }
   }
-  return { selector, requested: count, available: total, clicked };
+  return { selector, requested: count, available: refreshedTotal, clicked };
 }
 
 async function clickWithMousePath(page, locator, options = {}) {
@@ -2163,17 +2262,19 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       const selectors = await getScenarioFieldSelectors(page, root, config, 3);
       const injections = [];
       await page.waitForTimeout(Number(process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
+      const dispatchEvents = readBoolean('VALUE_INJECTION_DISPATCH_EVENTS', true);
       for (let index = 0; index < selectors.length; index += 1) {
-        injections.push(await setFieldValueWithoutKeys(root.locator(selectors[index]), `${username}-${index}`));
+        injections.push(await setFieldValueWithoutKeys(root.locator(selectors[index]), `${username}-${index}`, { dispatchEvents }));
       }
       scenarioDetails.valueInjection = {
         fieldCount: selectors.length,
         selectors,
         injections,
+        dispatchEvents,
         expectedToken: 'valueInjection',
         expectedPosition: 0,
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'cold_focus': {
@@ -2198,14 +2299,16 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'synthetic_events': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, 1);
+      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.SYNTHETIC_EVENTS_FIELD_COUNT || 3));
       const events = [];
-      for (const selector of selectors) {
-        events.push(await dispatchSyntheticInputEvents(root.locator(selector), username));
+      for (let index = 0; index < selectors.length; index += 1) {
+        const selector = selectors[index];
+        events.push(await dispatchSyntheticInputEvents(root.locator(selector), `${username}-${index}`));
       }
       scenarioDetails.syntheticEvents = {
         selectors,
         events,
+        fieldCount: selectors.length,
         expectedToken: 'syntheticEvents',
         expectedPosition: 1,
       };
@@ -2213,13 +2316,13 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'pointer_lock': {
-      const centerClicks = await clickDistinctCenterTargets(root, Number(process.env.POINTER_LOCK_CLICK_COUNT || 5));
+      const centerClicks = await clickDistinctCenterTargets(page, root, Number(process.env.POINTER_LOCK_CLICK_COUNT || 5));
       scenarioDetails.pointerLock = {
         ...centerClicks,
         expectedToken: 'pointerLock',
         expectedPosition: 2,
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'pointer_travel': {
@@ -3099,7 +3202,11 @@ async function runTarget(target, config) {
     const expectedDfsE8 = process.env.EXPECTED_DFS_E_8 || process.env.RELEASE_VERSION;
     if (expectedDfsE8) {
       const actual = initialCookieMap.dfs_E_8 || getFingerprintValue(initialFingerprint, 'dfs_E_8');
-      const releaseComparison = { expected: expectedDfsE8, actual, matches: String(actual) === String(expectedDfsE8) };
+      const releaseComparison = {
+        expected: expectedDfsE8,
+        actual,
+        matches: String(actual) === String(expectedDfsE8),
+      };
       const releaseFile = saveJson(path.join(outputDir, 'release-version-comparison.json'), releaseComparison);
       addResult(
         results,
