@@ -151,7 +151,7 @@ PERFORM_INTERACTION_SCENARIO_TESTS=true
 INTERACTION_TEST_SCENARIOS=A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8,B9,B10,B11,C1,C2,C3,C4
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 DFS_E7_FORMAT=auto
-DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index
+DFS_E7_SCORE_SHUFFLE_MAPPING=canonical-index-to-shuffled-index
 POST_LOAD_WAIT_MS=2000
 SCRIPT_OVERRIDE_MATCH=/aegis-binaries\/dfs\.js/i
 SCRIPT_OVERRIDE_SOURCE=C:\GitRepo\dfsScripts\.ignore\dfs121beta.js
@@ -163,7 +163,7 @@ Keep `HEADLESS=true` for request-capture flows where headed browser automation c
 
 Use `SCRIPT_OVERRIDE_*` to replace `dfs.js` and `LEVO_SCRIPT_OVERRIDE_*` to replace `levo.js`. Each override needs both a match pattern and a source path or HTTPS URL.
 
-For numeric `dfs_E_7`, the runner splits the value into 2-digit score tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_E_5`. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, token 4 `coldFocus`, then eight per-field dimensions per suspicious field. `DFS_E7_SCORE_SHUFFLE_MAPPING=shuffled-index-to-canonical-index` is the default.
+For numeric `dfs_E_7`, the runner splits the value into 2-digit score tokens and de-permutes them with a Mulberry32 Fisher-Yates shuffle seeded from the first 8 hex characters of `dfs_F_5`. The shuffle output is treated as `canonical index -> wire index`, then inverted to recover canonical token positions. The canonical layout is token 0 `valueInjection`, token 1 `syntheticEvents`, token 2 `pointerLock`, token 3 `pointerTravel`, token 4 `coldFocus`, then eight per-field dimensions per suspicious field. `DFS_E7_SCORE_SHUFFLE_MAPPING=canonical-index-to-shuffled-index` is the default.
 
 Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe is reliable on the first load but later becomes hidden or re-rendered. The runner will submit the login form before mouse telemetry and before reload, then still run the remaining checks.
 
@@ -175,7 +175,7 @@ For `value_injection`, the runner assigns values across `VALUE_INJECTION_FIELD_C
 
 For `synthetic_events`, the runner dispatches untrusted pointer, mouse, keyboard, `beforeinput`, `input`, and `change` events across `SYNTHETIC_EVENTS_FIELD_COUNT=4` fields by default.
 
-For `pointer_lock`, the runner uses dedicated scratch buttons by default (`POINTER_LOCK_USE_SCRATCH_TARGETS=true`), clicks each target with Playwright's default center click (`POINTER_LOCK_USE_LOCATOR_CLICK=true`), and uses synthetic score refresh by default (`POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT=true`) to avoid real-page navigation.
+For `pointer_lock`, the runner uses dedicated scratch buttons by default (`POINTER_LOCK_USE_SCRATCH_TARGETS=true`), clicks each target at exact center with `page.mouse.click` by default (`POINTER_LOCK_USE_LOCATOR_CLICK=false`), and uses synthetic score refresh by default (`POINTER_LOCK_FORCE_SYNTHETIC_SUBMIT=true`) to avoid real-page navigation.
 
 For `pointer_travel`, the runner clicks `POINTER_TRAVEL_CLICK_COUNT=3` fields without mouse-path interpolation, then adds the stronger mouse-teleport probe by default (`POINTER_TRAVEL_USE_MOUSE_TELEPORT=true`) and uses synthetic score refresh (`POINTER_TRAVEL_FORCE_SYNTHETIC_SUBMIT=true`).
 
@@ -208,7 +208,7 @@ fill_speed             5ms/char password typing; token[10] >= 85
 focus_no_pointer       programmatic focus then type; token[11] = 99
 key_input_mismatch_cdp CDP Input.insertText without keydowns; token[12] >= 90; Chromium only
 key_input_mismatch_paste_negative paste-style insert should not fire mismatch; token[12] = 0
-human_baseline         random cadence and offset submit; non-coldFocus tokens <= 0 or unchanged from baseline
+human_baseline         random cadence and non-navigating offset click by default; non-coldFocus tokens <= 0 or unchanged from baseline
 human_pause_baseline   short pause mid-typing on username and password; non-coldFocus tokens <= 20 or unchanged from baseline
 human_mouse_path       mousemove path between actions; token[3] <= 20
 browser_autofill_suppression validates autofill suppression when browser autofill is observed
@@ -449,7 +449,7 @@ evidence/<releaseversion>/summary-report.json
 - Cookie-to-fingerprint comparisons
 - `dfs_E_6` browser detection format and consistency
 - `dfs_E_7` score-token expectations for the numeric agentic detection wire format
-  - numeric values are split into 2-digit tokens and de-permuted from `dfs_E_5`
+  - numeric values are split into 2-digit tokens and de-permuted from `dfs_F_5`
   - interaction scenarios validate global dimensions and per-field dimensions by canonical token position
 - `dfs_E_1` non-incognito expectation, unless `PERFORM_PRIVATE_MODE_DETECTION_TEST=false`
 - Optional private/incognito browser launch expectation, unless `PERFORM_PRIVATE_MODE_BROWSER_TEST=false`

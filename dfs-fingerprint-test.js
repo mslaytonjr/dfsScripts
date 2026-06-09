@@ -540,9 +540,10 @@ function splitDfsE7ScoreTokens(value) {
 
 function getDfsE7ScoreShuffle(seedHex, tokenCount) {
   const seedText = String(seedHex || '').slice(0, 8);
-  if (!/^[0-9a-f]{8}$/i.test(seedText) || !Number.isInteger(tokenCount) || tokenCount <= 0) return null;
+  if (!Number.isInteger(tokenCount) || tokenCount <= 0) return null;
 
-  const seed = parseInt(seedText, 16);
+  const seedSource = /^[0-9a-f]{8}$/i.test(seedText) ? seedText : '00000000';
+  const seed = parseInt(seedSource, 16) >>> 0;
   const random = mulberry32(seed);
   const indexes = Array.from({ length: tokenCount }, (_, index) => index);
   for (let index = indexes.length - 1; index > 0; index -= 1) {
@@ -552,10 +553,12 @@ function getDfsE7ScoreShuffle(seedHex, tokenCount) {
 
   return {
     enabled: true,
-    seedHex: seedText,
+    seedHex: seedSource,
+    seedSource,
     seed,
+    canonicalIndexToWireIndex: indexes,
     shuffledCanonicalIndexes: indexes,
-    mapping: readString('DFS_E7_SCORE_SHUFFLE_MAPPING', 'shuffled-index-to-canonical-index'),
+    mapping: readString('DFS_E7_SCORE_SHUFFLE_MAPPING', 'canonical-index-to-shuffled-index'),
   };
 }
 
@@ -944,9 +947,9 @@ async function collectDfsControlDiagnostics(page, context, outputDir, resultConf
       ''
   );
   const e7ScoreSeed =
-    documentDfsCookies.dfs_E_5 ||
-    contextDfsCookies.dfs_E_5 ||
-    getFingerprintValue(fingerprint, 'dfs_E_5');
+    documentDfsCookies.dfs_F_5 ||
+    contextDfsCookies.dfs_F_5 ||
+    getFingerprintValue(fingerprint, 'dfs_F_5');
   let missingDfsE7Screenshot = null;
 
   if (!e7) {
@@ -977,7 +980,7 @@ async function collectDfsControlDiagnostics(page, context, outputDir, resultConf
     dfs_E_7: e7,
     dfs_E_7_format: getDfsE7Format(e7),
     dfs_E_7_score_tokens: decodeDfsE7ScoreTokens(e7, e7ScoreSeed),
-    dfs_E_5_score_seed_source: e7ScoreSeed,
+    dfs_F_5_score_seed_source: e7ScoreSeed,
     missingDfsE7Screenshot,
   };
 }
@@ -1992,6 +1995,60 @@ async function getScenarioFieldSelectors(page, root, config, minimumCount = 1) {
   return selectors;
 }
 
+async function ensureFocusAnomalyScratchField(page, root) {
+  const createField = () => {
+    const id = `dfs-focus-anomaly-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.name = id;
+    input.autocomplete = 'off';
+    input.setAttribute('data-dfs-focus-anomaly-scratch', 'true');
+    input.style.cssText = [
+      'position:fixed',
+      'left:24px',
+      'top:120px',
+      'width:180px',
+      'height:28px',
+      'z-index:2147483647',
+      'opacity:1',
+      'background:#fff',
+      'color:#111',
+      'border:1px solid #999',
+    ].join(';');
+    document.body.appendChild(input);
+    return `#${id}`;
+  };
+
+  if (root && typeof root.evaluate === 'function') return root.evaluate(createField);
+  if (root && typeof root.locator === 'function') {
+    return root.locator('body').evaluate((body) => {
+      const id = `dfs-focus-anomaly-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = id;
+      input.name = id;
+      input.autocomplete = 'off';
+      input.setAttribute('data-dfs-focus-anomaly-scratch', 'true');
+      input.style.cssText = [
+        'position:fixed',
+        'left:24px',
+        'top:120px',
+        'width:180px',
+        'height:28px',
+        'z-index:2147483647',
+        'opacity:1',
+        'background:#fff',
+        'color:#111',
+        'border:1px solid #999',
+      ].join(';');
+      body.appendChild(input);
+      return `#${id}`;
+    });
+  }
+  return page.evaluate(createField);
+}
+
 async function setFieldValueWithoutKeys(locator, value, options = {}) {
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   return locator.evaluate((el, payload) => {
@@ -2000,7 +2057,7 @@ async function setFieldValueWithoutKeys(locator, value, options = {}) {
     if (document.activeElement === el) el.blur();
     const before = el.value;
     const valueDescriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
-    if (valueDescriptor && typeof valueDescriptor.set === 'function') {
+    if (payload.useNativeSetter && valueDescriptor && typeof valueDescriptor.set === 'function') {
       valueDescriptor.set.call(el, nextValue);
     } else {
       el.value = nextValue;
@@ -2033,6 +2090,7 @@ async function setFieldValueWithoutKeys(locator, value, options = {}) {
   }, {
     nextValue: String(value),
     dispatchEvents: options.dispatchEvents !== false,
+    useNativeSetter: options.useNativeSetter === true,
   });
 }
 
@@ -2190,12 +2248,22 @@ async function typeWithVariableDelay(page, locator, value, minMs, maxMs, options
   await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
   if (!options.skipClick) await locator.click();
   const delays = [];
-  for (const char of String(value)) {
-    const delay = minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs + 1));
+  const text = String(value);
+  const spread = Math.max(1, maxMs - minMs);
+  const highVariance = options.highVariance === true;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const bucketBase = highVariance && index % 3 === 1
+      ? minMs + Math.floor(spread * 0.78)
+      : highVariance && index % 3 === 2
+        ? minMs + Math.floor(spread * 0.35)
+        : minMs;
+    const bucketSize = highVariance ? Math.max(8, Math.floor(spread * 0.16)) : spread + 1;
+    const delay = Math.min(maxMs, bucketBase + Math.floor(Math.random() * bucketSize));
     delays.push(delay);
     await page.keyboard.type(char, { delay });
   }
-  return { value: String(value), delays, coefficientOfVariation: coefficientOfVariation(delays) };
+  return { value: text, delays, coefficientOfVariation: coefficientOfVariation(delays), highVariance };
 }
 
 async function typeWithFixedCadenceEvents(locator, value, delayMs) {
@@ -2471,7 +2539,7 @@ async function clickDistinctCenterTargets(page, root, count) {
       const box = await control.boundingBox();
       if (!box) throw new Error('Missing bounding box for center click target');
       const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-      if (readBoolean('POINTER_LOCK_USE_LOCATOR_CLICK', true)) {
+      if (readBoolean('POINTER_LOCK_USE_LOCATOR_CLICK', false)) {
         await control.click({ timeout: 3000, noWaitAfter: true });
         clicked.push({ index, center, method: 'locator.click_default_center' });
       } else {
@@ -2493,10 +2561,35 @@ async function clickWithMousePath(page, locator, options = {}) {
   const offsetY = box.height > 8 ? Math.max(4, Math.min(box.height - 4, box.height * (options.offsetRatioY || 0.63))) : box.height / 2;
   const x = box.x + offsetX;
   const y = box.y + offsetY;
-  await page.mouse.move(x - 120, y - 80, { steps: Number(process.env.HUMAN_MOUSE_STEPS || 10) });
-  await page.mouse.move(x, y, { steps: Number(process.env.HUMAN_MOUSE_STEPS || 10) });
+  const steps = Number(process.env.HUMAN_MOUSE_STEPS || 24);
+  await page.mouse.move(x - 180, y - 120, { steps });
+  await page.mouse.move(x - 18, y - 9, { steps: Math.max(4, Math.floor(steps / 2)) });
+  await page.mouse.move(x + 3, y - 2, { steps: 4 });
+  await page.mouse.move(x, y, { steps: 3 });
   await page.mouse.click(x, y);
-  return { clicked: true, x, y, steps: Number(process.env.HUMAN_MOUSE_STEPS || 10) };
+  return { clicked: true, x, y, steps, jitterMoves: 2 };
+}
+
+async function clickNonNavigatingHumanTarget(page, root, options = {}) {
+  const selectors = await ensureAgenticScratchClickTargets(page, root, 1);
+  const selector = selectors[0] || '#dfs-agentic-click-target-0';
+  const click = await clickWithMousePath(page, root.locator(selector), options);
+  return {
+    ...click,
+    selector,
+    method: 'non_navigating_scratch_button',
+  };
+}
+
+async function clickHumanScenarioSubmit(page, root, config, options = {}) {
+  if (config.submitSelector && readBoolean('HUMAN_BASELINE_CLICK_REAL_SUBMIT', false)) {
+    return {
+      ...await clickWithMousePath(page, root.locator(config.submitSelector), options),
+      selector: config.submitSelector,
+      method: 'configured_submit',
+    };
+  }
+  return clickNonNavigatingHumanTarget(page, root, options);
 }
 
 async function triggerBehaviorScore(page, root, config, options = {}) {
@@ -2567,7 +2660,7 @@ async function readBehaviorState(page) {
   const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
   const f5 = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
   const e5 = cookies.dfs_E_5 || getFingerprintValue(fingerprint, 'dfs_E_5');
-  const scoreState = decodeDfsE7ScoreTokens(e7, e5);
+  const scoreState = decodeDfsE7ScoreTokens(e7, f5);
   return {
     cookies,
     fingerprint,
@@ -2656,7 +2749,10 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       await page.waitForTimeout(Number(process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
       const dispatchEvents = readBoolean('VALUE_INJECTION_DISPATCH_EVENTS', true);
       for (let index = 0; index < selectors.length; index += 1) {
-        injections.push(await setFieldValueWithoutKeys(root.locator(selectors[index]), `${username}-${index}`, { dispatchEvents }));
+        injections.push(await setFieldValueWithoutKeys(root.locator(selectors[index]), `${username}-${index}`, {
+          dispatchEvents,
+          useNativeSetter: readBoolean('VALUE_INJECTION_USE_NATIVE_SETTER', false),
+        }));
       }
       scenarioDetails.valueInjection = {
         fieldCount: selectors.length,
@@ -2746,6 +2842,7 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       await page.waitForTimeout(Number(process.env.INJECTED_TEXT_ECHO_WINDOW_WAIT_MS || process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
       scenarioDetails.injectedText = await setFieldValueWithoutKeys(field, username, {
         dispatchEvents: readBoolean('INJECTED_TEXT_DISPATCH_EVENTS', true),
+        useNativeSetter: readBoolean('INJECTED_TEXT_USE_NATIVE_SETTER', false),
       });
       scenarioDetails.injectedText.expectedToken = 'field1.injectedText';
       scenarioDetails.injectedText.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.INJECTED_TEXT);
@@ -2773,16 +2870,23 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'human_like_cadence': {
-      const minMs = Number(process.env.HUMAN_TYPE_MIN_DELAY_MS || 60);
-      const maxMs = Number(process.env.HUMAN_TYPE_MAX_DELAY_MS || 180);
-      scenarioDetails.humanLikeCadence = await typeWithVariableDelay(page, root.locator(config.usernameSelector), username, minMs, maxMs);
+      const minMs = Number(process.env.HUMAN_TYPE_MIN_DELAY_MS || 50);
+      const maxMs = Number(process.env.HUMAN_TYPE_MAX_DELAY_MS || 300);
+      scenarioDetails.humanLikeCadence = await typeWithVariableDelay(page, root.locator(config.usernameSelector), username, minMs, maxMs, {
+        highVariance: readBoolean('HUMAN_LIKE_CADENCE_HIGH_VARIANCE', true),
+      });
       scenarioDetails.humanLikeCadence.expectedToken = 'field1.cadenceRigidity';
       scenarioDetails.humanLikeCadence.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.CADENCE_RIGIDITY);
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('HUMAN_LIKE_CADENCE_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'focus_anomaly':
-      scenarioDetails.focusAnomaly = await dispatchFocusAnomaly(root.locator(config.usernameSelector), username);
+      const focusAnomalySelector = readBoolean('FOCUS_ANOMALY_USE_SCRATCH_FIELD', false)
+        ? await ensureFocusAnomalyScratchField(page, root)
+        : config.usernameSelector;
+      scenarioDetails.focusAnomaly = await dispatchFocusAnomaly(root.locator(focusAnomalySelector), username);
+      scenarioDetails.focusAnomaly.selector = focusAnomalySelector;
+      scenarioDetails.focusAnomaly.usesScratchField = focusAnomalySelector !== config.usernameSelector;
       scenarioDetails.focusAnomaly.expectedToken = 'field1.focusAnomaly';
       scenarioDetails.focusAnomaly.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.FOCUS_ANOMALY);
       triggerOptions.forceSyntheticSubmit = readBoolean('FOCUS_ANOMALY_FORCE_SYNTHETIC_SUBMIT', true);
@@ -2804,8 +2908,8 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       const field = root.locator(selector);
       await field.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
       await field.click();
-      const text = readString('FILL_SPEED_TEXT', username || 'testuser1');
-      const delayMs = Number(process.env.FILL_SPEED_TYPE_DELAY_MS || 5);
+      const text = readString('FILL_SPEED_TEXT', `${username || 'testuser1'}${password || 'password123'}`);
+      const delayMs = Number(process.env.FILL_SPEED_TYPE_DELAY_MS || 0);
       await page.keyboard.type(String(text), { delay: delayMs });
       scenarioDetails.fillSpeed = {
         selector,
@@ -2873,17 +2977,18 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'human_baseline':
+      const baselineMinMs = Number(process.env.HUMAN_BASELINE_TYPE_MIN_DELAY_MS || process.env.HUMAN_TYPE_MIN_DELAY_MS || 50);
+      const baselineMaxMs = Number(process.env.HUMAN_BASELINE_TYPE_MAX_DELAY_MS || process.env.HUMAN_TYPE_MAX_DELAY_MS || 300);
       await clickWithMousePath(page, root.locator(config.usernameSelector));
-      scenarioDetails.usernameTyping = await typeWithVariableDelay(page, root.locator(config.usernameSelector), username, 70, 150, { skipClick: true });
+      scenarioDetails.usernameTyping = await typeWithVariableDelay(page, root.locator(config.usernameSelector), username, baselineMinMs, baselineMaxMs, { skipClick: true });
       if (config.passwordSelector) {
         await clickWithMousePath(page, root.locator(config.passwordSelector), { offsetRatioX: 0.42, offsetRatioY: 0.58 });
-        scenarioDetails.passwordTyping = await typeWithVariableDelay(page, root.locator(config.passwordSelector), password, 70, 150, { skipClick: true });
+        scenarioDetails.passwordTyping = await typeWithVariableDelay(page, root.locator(config.passwordSelector), password, baselineMinMs, baselineMaxMs, { skipClick: true });
       }
-      if (config.submitSelector) {
-        scenarioDetails.submitClick = await clickWithMousePath(page, root.locator(config.submitSelector), { offsetRatioX: 0.41, offsetRatioY: 0.52 });
-      }
+      scenarioDetails.baselineCadenceRange = { minMs: baselineMinMs, maxMs: baselineMaxMs };
+      scenarioDetails.submitClick = await clickHumanScenarioSubmit(page, root, config, { offsetRatioX: 0.41, offsetRatioY: 0.52 });
       triggerOptions.forceSyntheticSubmit = false;
-      triggerOptions.skipSubmit = Boolean(config.submitSelector);
+      triggerOptions.skipSubmit = true;
       break;
     case 'human_pause_baseline': {
       await clickWithMousePath(page, root.locator(config.usernameSelector));
@@ -2898,9 +3003,7 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
         await page.waitForTimeout(Number(process.env.HUMAN_PAUSE_MS || 500));
         await page.keyboard.type(passwordText.slice(3), { delay: 105 });
       }
-      if (config.submitSelector) {
-        scenarioDetails.submitClick = await clickWithMousePath(page, root.locator(config.submitSelector), { offsetRatioX: 0.36, offsetRatioY: 0.61 });
-      }
+      scenarioDetails.submitClick = await clickHumanScenarioSubmit(page, root, config, { offsetRatioX: 0.36, offsetRatioY: 0.61 });
       scenarioDetails.humanPauseBaseline = {
         usernameFirstChunkLength: Math.min(3, text.length),
         passwordIncluded: Boolean(config.passwordSelector),
@@ -2908,19 +3011,19 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
         pauseMs: Number(process.env.HUMAN_PAUSE_MS || 500),
       };
       triggerOptions.forceSyntheticSubmit = false;
-      triggerOptions.skipSubmit = Boolean(config.submitSelector);
+      triggerOptions.skipSubmit = true;
       break;
     }
     case 'human_mouse_path':
       await clickWithMousePath(page, root.locator(config.usernameSelector));
       if (config.passwordSelector) await clickWithMousePath(page, root.locator(config.passwordSelector), { offsetRatioX: 0.45, offsetRatioY: 0.55 });
-      if (config.submitSelector) await clickWithMousePath(page, root.locator(config.submitSelector), { offsetRatioX: 0.4, offsetRatioY: 0.6 });
+      scenarioDetails.submitClick = await clickHumanScenarioSubmit(page, root, config, { offsetRatioX: 0.4, offsetRatioY: 0.6 });
       scenarioDetails.humanMousePath = {
         usedIntermediateMouseMoves: true,
         expectedToken: 'pointerTravel',
         expectedPosition: 3,
       };
-      triggerOptions.skipSubmit = Boolean(config.submitSelector);
+      triggerOptions.skipSubmit = true;
       break;
     default:
       return {
@@ -3483,14 +3586,14 @@ async function runTarget(target, config) {
 
     const e7 = String(initialCookieMap.dfs_E_7 || getFingerprintValue(initialFingerprint, 'dfs_E_7') || '');
     const e7Format = getDfsE7Format(e7);
-    const e7ScoreTokens = decodeDfsE7ScoreTokens(e7, initialCookieMap.dfs_E_5 || getFingerprintValue(initialFingerprint, 'dfs_E_5'));
+    const e7ScoreTokens = decodeDfsE7ScoreTokens(e7, initialCookieMap.dfs_F_5 || getFingerprintValue(initialFingerprint, 'dfs_F_5'));
     const e7Evaluation = {
       dfs_E_7: e7,
       dfs_E_7_format: e7Format,
       dfs_E_7_score_tokens: e7ScoreTokens,
       expectedFormat: 'score-tokens',
       expectedLengthRule: '10 + (nFields x 16) digits; 10-74 digits total; 2 decimal digits per token',
-      dePermutationSeedSource: 'dfs_E_5 first 8 hex characters',
+      dePermutationSeedSource: 'dfs_F_5 first 8 hex characters',
     };
     const e7Failures = [
       ...(e7Format === 'score-tokens' ? [] : [`dfs_E_7 expected score-token format, got ${e7Format}`]),
