@@ -171,7 +171,7 @@ For Chase runs that land on the system-requirements page, the runner marks the t
 
 `INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
 
-For `value_injection`, the runner assigns values across `VALUE_INJECTION_FIELD_COUNT=4` fields by default. It waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update.
+For `value_injection`, the runner assigns values across `VALUE_INJECTION_FIELD_COUNT=4` fields by default. It waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update. The global value-injection score is expected to equal `min(99, round(100 * injectedFields / totalFields))` within `+/- 1`, using the fields inspected and targeted by the scenario.
 
 For `synthetic_events`, the runner dispatches untrusted pointer, mouse, keyboard, `beforeinput`, `input`, and `change` events across `SYNTHETIC_EVENTS_FIELD_COUNT=4` fields by default.
 
@@ -192,7 +192,7 @@ Transient interaction and spoofing-control failures are retried with `TEST_RETRY
 Valid numeric `dfs_E_7` score-token interaction scenarios:
 
 ```text
-value_injection        direct el.value assignment on 3+ fields; token[0] >= 80
+value_injection        direct el.value assignment on scenario fields; token[0] ~= min(99, round(100 * injectedFields / totalFields))
 synthetic_events       dispatch untrusted input/change events; token[1] >= 80
 pointer_lock           center-click 5+ controls; token[2] >= 60
 pointer_travel         click targets without intermediate mousemove path; token[3] >= 50

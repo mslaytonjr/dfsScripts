@@ -820,6 +820,72 @@ async function installScriptOverride(context, outputDir) {
   return details;
 }
 
+async function installInputValueSetterTraceProbe(context) {
+  if (!readBoolean('INPUT_VALUE_SETTER_TRACE_PROBE', false)) return false;
+  await context.addInitScript(() => {
+    window.__DFS_VALUE_SETTER_TRACE_LOG = [];
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    if (!descriptor || typeof descriptor.set !== 'function') {
+      window.__DFS_VALUE_SETTER_TRACE_LOG.push({
+        type: 'missing-setter',
+        message: 'HTMLInputElement.prototype.value setter is not available',
+        timestamp: Date.now(),
+      });
+      return;
+    }
+    const origSet = descriptor.set;
+    const origGet = descriptor.get;
+    Object.defineProperty(HTMLInputElement.prototype, 'value', {
+      set: function(v) {
+        const label = this.name || this.id || this.getAttribute('autocomplete') || this.type || '<unlabeled>';
+        const length = v == null ? 0 : String(v).length;
+        const stack = (() => {
+          try {
+            return new Error('[value-set-probe] value set fired').stack || '';
+          } catch {
+            return '';
+          }
+        })();
+        window.__DFS_VALUE_SETTER_TRACE_LOG.push({
+          type: 'value-set',
+          label,
+          id: this.id || '',
+          name: this.name || '',
+          inputType: this.type || '',
+          autocomplete: this.getAttribute('autocomplete') || '',
+          valueLength: length,
+          value: String(v),
+          stack,
+          timestamp: Date.now(),
+        });
+        return origSet.call(this, v);
+      },
+      get: origGet,
+      configurable: true,
+    });
+  });
+  return true;
+}
+
+function captureInputValueSetterTrace(message, target = []) {
+  const text = message.text();
+  if (!text.includes('[value-set-probe]')) return false;
+  target.push({
+    type: message.type(),
+    text,
+    location: message.location(),
+    timestamp: new Date().toISOString(),
+  });
+  return true;
+}
+
+async function readInputValueSetterTraceLog(page) {
+  if (!readBoolean('INPUT_VALUE_SETTER_TRACE_PROBE', false)) return [];
+  return page.evaluate(() => Array.isArray(window.__DFS_VALUE_SETTER_TRACE_LOG)
+    ? window.__DFS_VALUE_SETTER_TRACE_LOG
+    : []);
+}
+
 async function waitForLoginRequest(page, matcher) {
   const matches = matcherFromConfig(matcher);
   return page.waitForRequest((request) => matches(request.url()), {
@@ -1678,10 +1744,31 @@ function normalizeInteractionScenarioName(name) {
   return aliases[normalized] || normalized;
 }
 
-function getAgenticScoreExpectations(scenarioName) {
+function getValueInjectionExpectation(performed = {}) {
+  const details = performed.valueInjection || {};
+  const totalFields = Number(details.totalFields || (details.selectors || []).length || 0);
+  const injectedFields = Number(details.injectedFields || (details.injections || []).filter((injection) => {
+    return injection && injection.after !== undefined && String(injection.after) !== String(injection.before || '');
+  }).length || 0);
+  const expected = totalFields > 0
+    ? Math.min(99, Math.round((100 * injectedFields) / totalFields))
+    : 0;
+  return {
+    position: E7_POS.VALUE_INJECTION,
+    dimension: 'valueInjection',
+    operator: '==',
+    expected,
+    tolerance: 1,
+    formula: 'min(99, round(100 * injectedFields / totalFields))',
+    injectedFields,
+    totalFields,
+  };
+}
+
+function getAgenticScoreExpectations(scenarioName, performed = null) {
   const field1 = (offset) => getDfsE7FieldTokenPosition(0, offset);
   const expectations = {
-    value_injection: [{ position: E7_POS.VALUE_INJECTION, dimension: 'valueInjection', operator: '>=', expected: 80 }],
+    value_injection: [getValueInjectionExpectation(performed || {})],
     synthetic_events: [{ position: E7_POS.SYNTHETIC_EVENTS, dimension: 'syntheticEvents', operator: '>=', expected: 80 }],
     pointer_lock: [{ position: E7_POS.POINTER_LOCK, dimension: 'pointerLock', operator: '>=', expected: 60 }],
     pointer_travel: [{ position: E7_POS.POINTER_TRAVEL, dimension: 'pointerTravel', operator: '>=', expected: 50 }],
@@ -1718,7 +1805,7 @@ function compareScore(actual, operator, expected, tolerance = 0) {
   if (operator === '<=') return Number(actual) <= Number(expected) + Number(tolerance || 0);
   if (operator === '>') return Number(actual) > Number(expected) - Number(tolerance || 0);
   if (operator === '<') return Number(actual) < Number(expected) + Number(tolerance || 0);
-  return Number(actual) === Number(expected);
+  return Math.abs(Number(actual) - Number(expected)) <= Number(tolerance || 0);
 }
 
 function getAgenticScoreFailures(scoreState, expectations, baselineState = null) {
@@ -1995,6 +2082,96 @@ async function getScenarioFieldSelectors(page, root, config, minimumCount = 1) {
   return selectors;
 }
 
+async function getValueInjectionFieldTargets(page, root, minimumCount = 1) {
+  const inspectFields = () => {
+    const quoteAttribute = (value) => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const selectorFor = (el) => {
+      const tagName = el.tagName.toLowerCase();
+      if (el.id) return `#${CSS.escape(el.id)}`;
+      const name = el.getAttribute('name');
+      if (name) return `${tagName}[name="${quoteAttribute(name)}"]`;
+      return '';
+    };
+    const candidates = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]), textarea'));
+    return candidates
+      .filter((el) => !el.disabled && !el.readOnly)
+      .map((el) => ({ el, selector: selectorFor(el) }))
+      .filter((candidate) => candidate.selector)
+      .map((el) => {
+        const rect = el.el.getBoundingClientRect();
+        return {
+          selector: el.selector,
+          tagName: el.el.tagName.toLowerCase(),
+          type: (el.el.getAttribute('type') || '').toLowerCase(),
+          id: el.el.id || '',
+          name: el.el.getAttribute('name') || '',
+          autocomplete: el.el.getAttribute('autocomplete') || '',
+          visible: Boolean(rect.width && rect.height),
+          boundingBox: {
+            x: Math.round(rect.x * 1000) / 1000,
+            y: Math.round(rect.y * 1000) / 1000,
+            width: Math.round(rect.width * 1000) / 1000,
+            height: Math.round(rect.height * 1000) / 1000,
+          },
+        };
+      })
+      .filter((field) => field.visible);
+  };
+
+  let inspectedFields = [];
+  if (root && typeof root.evaluate === 'function') {
+    inspectedFields = await root.evaluate(inspectFields);
+  } else if (root && typeof root.locator === 'function') {
+    inspectedFields = await root.locator('body').evaluate((body) => {
+      const quoteAttribute = (value) => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const selectorFor = (el) => {
+        const tagName = el.tagName.toLowerCase();
+        if (el.id) return `#${CSS.escape(el.id)}`;
+        const name = el.getAttribute('name');
+        if (name) return `${tagName}[name="${quoteAttribute(name)}"]`;
+        return '';
+      };
+      const candidates = Array.from(body.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]), textarea'));
+      return candidates
+        .filter((el) => !el.disabled && !el.readOnly)
+        .map((el) => ({ el, selector: selectorFor(el) }))
+        .filter((candidate) => candidate.selector)
+        .map((el) => {
+          const rect = el.el.getBoundingClientRect();
+          return {
+            selector: el.selector,
+            tagName: el.el.tagName.toLowerCase(),
+            type: (el.el.getAttribute('type') || '').toLowerCase(),
+            id: el.el.id || '',
+            name: el.el.getAttribute('name') || '',
+            autocomplete: el.el.getAttribute('autocomplete') || '',
+            visible: Boolean(rect.width && rect.height),
+            boundingBox: {
+              x: Math.round(rect.x * 1000) / 1000,
+              y: Math.round(rect.y * 1000) / 1000,
+              width: Math.round(rect.width * 1000) / 1000,
+              height: Math.round(rect.height * 1000) / 1000,
+            },
+          };
+        })
+        .filter((field) => field.visible);
+    });
+  } else {
+    inspectedFields = await page.evaluate(inspectFields);
+  }
+
+  const selectors = inspectedFields.map((field) => field.selector);
+  const scratchSelectors = selectors.length === 0
+    ? await ensureAgenticScratchFields(page, root, minimumCount)
+    : [];
+  return {
+    selectors: selectors.concat(scratchSelectors),
+    inspectedFields,
+    scratchSelectors,
+    totalFields: selectors.length + scratchSelectors.length,
+  };
+}
+
 async function ensureFocusAnomalyScratchField(page, root) {
   const createField = () => {
     const id = `dfs-focus-anomaly-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
@@ -2050,7 +2227,10 @@ async function ensureFocusAnomalyScratchField(page, root) {
 }
 
 async function setFieldValueWithoutKeys(locator, value, options = {}) {
-  await locator.waitFor({ state: 'visible', timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000) });
+  await locator.waitFor({
+    state: options.requireVisible === false ? 'attached' : 'visible',
+    timeout: Number(process.env.FIELD_TIMEOUT_MS || 45000),
+  });
   return locator.evaluate((el, payload) => {
     const nextValue = payload.nextValue;
     const dispatchEvents = payload.dispatchEvents;
@@ -2655,21 +2835,26 @@ async function triggerBehaviorScore(page, root, config, options = {}) {
 }
 
 async function readBehaviorState(page) {
-  const cookies = parseCookieArray(await getDfsCookies(page));
   const fingerprint = await getFingerprint(page);
-  const e7 = String(cookies.dfs_E_7 || getFingerprintValue(fingerprint, 'dfs_E_7') || '');
-  const f5 = cookies.dfs_F_5 || getFingerprintValue(fingerprint, 'dfs_F_5');
-  const e5 = cookies.dfs_E_5 || getFingerprintValue(fingerprint, 'dfs_E_5');
+  const cookies = parseCookieArray(await getDfsCookies(page));
+  const fingerprintE7 = getFingerprintValue(fingerprint, 'dfs_E_7');
+  const fingerprintF5 = getFingerprintValue(fingerprint, 'dfs_F_5');
+  const fingerprintE5 = getFingerprintValue(fingerprint, 'dfs_E_5');
+  const e7 = String(fingerprintE7 || cookies.dfs_E_7 || '');
+  const f5 = fingerprintF5 || cookies.dfs_F_5;
+  const e5 = fingerprintE5 || cookies.dfs_E_5;
   const scoreState = decodeDfsE7ScoreTokens(e7, f5);
   return {
     cookies,
     fingerprint,
     dfs_E_5: e5,
     dfs_E_7: e7,
+    dfs_E_7_source: fingerprintE7 ? 'fingerprint' : cookies.dfs_E_7 ? 'cookie' : 'missing',
     dfs_E_7_format: getDfsE7Format(e7),
     dfs_E_7_score_tokens: scoreState,
     dfs_F_5: f5,
-    dfs_F_2: cookies.dfs_F_2 || getFingerprintValue(fingerprint, 'dfs_F_2'),
+    dfs_F_5_source: fingerprintF5 ? 'fingerprint' : cookies.dfs_F_5 ? 'cookie' : 'missing',
+    dfs_F_2: getFingerprintValue(fingerprint, 'dfs_F_2') || cookies.dfs_F_2,
   };
 }
 
@@ -2744,7 +2929,8 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
 
   switch (scenarioName) {
     case 'value_injection': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, Number(process.env.VALUE_INJECTION_FIELD_COUNT || 4));
+      const fieldTargets = await getValueInjectionFieldTargets(page, root, Number(process.env.VALUE_INJECTION_FIELD_COUNT || 4));
+      const selectors = fieldTargets.selectors;
       const injections = [];
       await page.waitForTimeout(Number(process.env.VALUE_INJECTION_ECHO_WINDOW_WAIT_MS || 2000));
       const dispatchEvents = readBoolean('VALUE_INJECTION_DISPATCH_EVENTS', true);
@@ -2752,11 +2938,19 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
         injections.push(await setFieldValueWithoutKeys(root.locator(selectors[index]), `${username}-${index}`, {
           dispatchEvents,
           useNativeSetter: readBoolean('VALUE_INJECTION_USE_NATIVE_SETTER', false),
+          requireVisible: false,
         }));
       }
       scenarioDetails.valueInjection = {
         fieldCount: selectors.length,
+        totalFields: fieldTargets.totalFields,
+        injectedFields: injections.filter((injection) => {
+          return injection && injection.after !== undefined && String(injection.after) !== String(injection.before || '');
+        }).length,
+        expectedFormula: 'min(99, round(100 * injectedFields / totalFields))',
         selectors,
+        inspectedFields: fieldTargets.inspectedFields,
+        scratchSelectors: fieldTargets.scratchSelectors,
         injections,
         dispatchEvents,
         expectedToken: 'valueInjection',
@@ -3056,8 +3250,13 @@ async function runInteractionScenario(browser, target, config, outputDir, result
         height: Number(process.env.VIEWPORT_HEIGHT || 900),
       },
     }));
+    await runStep(`install ${scenarioName} input value setter trace probe`, () => installInputValueSetterTraceProbe(scenarioContext));
     await runStep(`install ${scenarioName} script override`, () => installScriptOverride(scenarioContext, outputDir));
     scenarioPage = await runStep(`open ${scenarioName} interaction page`, () => scenarioContext.newPage());
+    const consoleValueSetterTraces = [];
+    scenarioPage.on('console', (message) => {
+      captureInputValueSetterTrace(message, consoleValueSetterTraces);
+    });
     await runStep(`navigate ${scenarioName} interaction page`, () => scenarioPage.goto(config.targetUrl, {
       waitUntil: process.env.GOTO_WAIT_UNTIL || 'domcontentloaded',
       timeout: Number(process.env.NAVIGATION_TIMEOUT_MS || 30000),
@@ -3078,10 +3277,11 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       );
       return;
     }
-    const scoreExpectations = getAgenticScoreExpectations(scenarioName);
+    const scoreExpectations = getAgenticScoreExpectations(scenarioName, performed);
     const expectationWait = await runStep(`wait for ${scenarioName} behavior expectations`, () => waitForBehaviorExpectations(scenarioPage, scoreExpectations, before.dfs_E_7_score_tokens));
     const after = expectationWait.state;
     const debugLog = await runStep(`read ${scenarioName} dfs_E_5 debug log`, () => getDfsE5DebugLog(scenarioPage));
+    const valueSetterTraces = await runStep(`read ${scenarioName} input value setter trace log`, () => readInputValueSetterTraceLog(scenarioPage));
     const scoreFailures = expectationWait.failures;
     const f2Changed = before.dfs_F_2 !== undefined && after.dfs_F_2 !== undefined && String(before.dfs_F_2) !== String(after.dfs_F_2);
     const failures = [...scoreFailures];
@@ -3094,18 +3294,22 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       before: {
         dfs_E_5: before.dfs_E_5,
         dfs_E_7: before.dfs_E_7,
+        dfs_E_7_source: before.dfs_E_7_source,
         dfs_E_7_format: before.dfs_E_7_format,
         dfs_E_7_score_tokens: before.dfs_E_7_score_tokens,
         dfs_F_5: before.dfs_F_5,
+        dfs_F_5_source: before.dfs_F_5_source,
         dfs_F_2: before.dfs_F_2,
       },
       performed,
       after: {
         dfs_E_5: after.dfs_E_5,
         dfs_E_7: after.dfs_E_7,
+        dfs_E_7_source: after.dfs_E_7_source,
         dfs_E_7_format: after.dfs_E_7_format,
         dfs_E_7_score_tokens: after.dfs_E_7_score_tokens,
         dfs_F_5: after.dfs_F_5,
+        dfs_F_5_source: after.dfs_F_5_source,
         dfs_F_2: after.dfs_F_2,
       },
       expectations: scoreExpectations,
@@ -3115,6 +3319,8 @@ async function runInteractionScenario(browser, target, config, outputDir, result
       trigger: performed.trigger,
       focusInputTiming: performed.focusInputTiming,
       mouseTeleport: performed.mouseTeleport,
+      valueSetterTraces,
+      consoleValueSetterTraces,
       debugLog,
     };
     if (failures.length > 0 && attempt < maxAttempts && failures.some(isRetryableTestMessage)) {
@@ -3424,6 +3630,7 @@ async function runTarget(target, config) {
   let initialDfsF1 = undefined;
   let initialDfsF2 = undefined;
   let scriptOverride = null;
+  let inputValueSetterTraceProbe = false;
 
   try {
     browser = await runStep('launch browser', () => browserType.launch(getLaunchOptions(target)));
@@ -3434,9 +3641,11 @@ async function runTarget(target, config) {
         height: Number(process.env.VIEWPORT_HEIGHT || 900),
       },
     }));
+    inputValueSetterTraceProbe = await runStep('install input value setter trace probe', () => installInputValueSetterTraceProbe(context));
     scriptOverride = await runStep('install script override', () => installScriptOverride(context, outputDir));
     page = await runStep('open new page', () => context.newPage());
     page.on('console', (message) => {
+      if (captureInputValueSetterTrace(message, consoleMessages)) return;
       if (message.type() === 'warning' || message.type() === 'error') {
         consoleMessages.push({
           type: message.type(),
@@ -3775,6 +3984,13 @@ async function runTarget(target, config) {
     }
 
     const consoleFile = saveJson(path.join(outputDir, 'console-log.json'), consoleMessages);
+    let inputValueSetterTraceFile = null;
+    if (inputValueSetterTraceProbe) {
+      const inputValueSetterTraces = page && !page.isClosed()
+        ? await readInputValueSetterTraceLog(page).catch((error) => ({ error: error.message }))
+        : { error: 'Page is closed; input value setter trace log unavailable.' };
+      inputValueSetterTraceFile = saveJson(path.join(outputDir, 'input-value-setter-traces.json'), inputValueSetterTraces);
+    }
     saveJson(path.join(outputDir, 'dfs-js-files.json'), {
       found: dfsJsFiles.length > 0,
       count: dfsJsFiles.length,
@@ -3801,6 +4017,7 @@ async function runTarget(target, config) {
       }
     }
 
+    metadata.inputValueSetterTraceProbe = inputValueSetterTraceProbe;
     metadata.finishedAt = new Date().toISOString();
     metadata.actualBrowserVersion = browser ? browser.version() : null;
     const summary = {
