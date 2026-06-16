@@ -29,17 +29,20 @@ const BROWSER_CODES = {
   comet: '06',
   atlas: '07',
 };
-const DFS_E7_GLOBAL_TOKENS = 5;
+const DFS_E7_GLOBAL_TOKENS = 8;
 const DFS_E7_PER_FIELD_TOKENS = 8;
 const DFS_E7_MAX_FIELDS = 4;
-const DFS_E7_MIN_DIGITS = DFS_E7_GLOBAL_TOKENS * 2;
-const DFS_E7_MAX_DIGITS = (DFS_E7_GLOBAL_TOKENS + (DFS_E7_MAX_FIELDS * DFS_E7_PER_FIELD_TOKENS)) * 2;
+const DFS_E7_MIN_DIGITS = 16;
+const DFS_E7_MAX_DIGITS = 80;
 const E7_POS = {
   VALUE_INJECTION: 0,
   SYNTHETIC_EVENTS: 1,
   POINTER_LOCK: 2,
   POINTER_TRAVEL: 3,
   COLD_FOCUS: 4,
+  AGENTIC_BROWSER: 5,
+  EXTENSION_PRESENT: 6,
+  DRIVER_PRESENT: 7,
 };
 const E7_FIELD = {
   INJECTED_TEXT: 0,
@@ -440,6 +443,100 @@ async function getBrowserDetectionFailureSignals(page) {
   });
 }
 
+async function getDfsE7GlobalTokenSignals(page) {
+  return page.evaluate(async () => {
+    async function readWebglRenderer() {
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) return '';
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        return debugInfo ? String(gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) || '') : String(gl.getParameter(gl.RENDERER) || '');
+      } catch (error) {
+        return `error: ${error.message}`;
+      }
+    }
+
+    async function probePermissionsQuery() {
+      try {
+        if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
+          return { available: false };
+        }
+        const source = Function.prototype.toString.call(navigator.permissions.query);
+        const result = await navigator.permissions.query({ name: 'notifications' }).catch((error) => ({ error: error.message }));
+        return {
+          available: true,
+          source,
+          nativeLike: /\[native code\]/.test(source),
+          resultState: result && result.state,
+          error: result && result.error,
+        };
+      } catch (error) {
+        return { available: true, error: error.message };
+      }
+    }
+
+    async function probeExtensionResponse() {
+      const candidates = [
+        'aapocclcgogkmnckokdopfmhonfmgoek',
+        'nkbihfbeogaeaoehlefnkodbefgpgknn',
+        'gighmmpiobklfepjocnamgkkbiglidom',
+      ];
+      if (!window.chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') {
+        return { apiAvailable: false, responded: false, candidates: [] };
+      }
+
+      const attempts = [];
+      for (const id of candidates) {
+        const attempt = await new Promise((resolve) => {
+          let settled = false;
+          const done = (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          try {
+            chrome.runtime.sendMessage(id, { type: 'dfs_probe' }, (response) => {
+              const lastError = chrome.runtime.lastError && chrome.runtime.lastError.message;
+              done({ id, responded: response !== undefined && !lastError, responseType: typeof response, lastError: lastError || '' });
+            });
+            setTimeout(() => done({ id, responded: false, timeout: true }), 250);
+          } catch (error) {
+            done({ id, responded: false, error: error.message });
+          }
+        });
+        attempts.push(attempt);
+      }
+      return {
+        apiAvailable: true,
+        responded: attempts.some((attempt) => attempt.responded),
+        candidates: attempts,
+      };
+    }
+
+    const renderer = await readWebglRenderer();
+    const permissionsQuery = await probePermissionsQuery();
+    const functionToStringSource = Function.prototype.toString.toString();
+    const pluginsLength = navigator.plugins ? navigator.plugins.length : null;
+
+    return {
+      capturedAt: new Date().toISOString(),
+      extension: await probeExtensionResponse(),
+      driver: {
+        navigatorWebdriver: navigator.webdriver === true,
+        renderer,
+        swiftShaderRenderer: /swiftshader/i.test(renderer),
+        functionToStringSource,
+        patchedFunctionToString: !/\[native code\]/.test(functionToStringSource),
+        permissionsQuery,
+        shimmedPermissionsQuery: permissionsQuery.available === true && permissionsQuery.nativeLike === false,
+        pluginsLength,
+        emptyPlugins: pluginsLength === 0,
+      },
+    };
+  });
+}
+
 async function getBrowserFailureDiagnostics(page) {
   return page.evaluate(async () => {
     async function readExpression(expression, getter) {
@@ -609,7 +706,7 @@ function decodeDfsE7ScoreTokens(value, seedHex) {
 
 function getDfsE7ScoreDimensions(tokenCount) {
   const fieldDimensions = ['injectedText', 'pasteFragmentation', 'cadenceRigidity', 'focusAnomaly', 'dwellAnomaly', 'fillSpeed', 'focusNoPointer', 'keyInputMismatch'];
-  const dimensions = ['valueInjection', 'syntheticEvents', 'pointerLock', 'pointerTravel', 'coldFocus'];
+  const dimensions = ['valueInjection', 'syntheticEvents', 'pointerLock', 'pointerTravel', 'coldFocus', 'agenticBrowser', 'extensionPresent', 'driverPresent'];
   for (let fieldIndex = 0; dimensions.length < tokenCount; fieldIndex += 1) {
     for (const dimension of fieldDimensions) {
       if (dimensions.length >= tokenCount) break;
@@ -628,6 +725,55 @@ function getDfsE7Score(scoreState, position) {
   const index = Number(position);
   if (index < 0 || index >= scoreState.scores.length) return null;
   return scoreState.scores[index];
+}
+
+function getDfsE6BrowserCode(value) {
+  const matches = String(value || '').match(/\d{2}/g);
+  return matches && matches.length > 0 ? matches[matches.length - 1] : '';
+}
+
+function buildDfsE7GlobalTokenEvaluation(e7ScoreTokens, dfsE6Value, signals = {}) {
+  const agenticBrowserCodes = new Set(['06', '07', '08', '09', '76', '77', '78', '79']);
+  const browserCode = getDfsE6BrowserCode(dfsE6Value);
+  const extensionResponded = Boolean(signals.extension && signals.extension.responded);
+  const driverReasons = [];
+  if (signals.driver && signals.driver.navigatorWebdriver) driverReasons.push('navigator.webdriver');
+  if (signals.driver && signals.driver.swiftShaderRenderer) driverReasons.push('SwiftShader renderer');
+  if (signals.driver && signals.driver.patchedFunctionToString) driverReasons.push('patched Function.prototype.toString');
+  if (signals.driver && signals.driver.shimmedPermissionsQuery) driverReasons.push('shimmed permissions.query');
+  if (signals.driver && signals.driver.emptyPlugins) driverReasons.push('empty plugins');
+
+  const expectations = [
+    {
+      position: E7_POS.AGENTIC_BROWSER,
+      dimension: 'agenticBrowser',
+      expected: agenticBrowserCodes.has(browserCode) ? 99 : 0,
+      reason: agenticBrowserCodes.has(browserCode)
+        ? `dfs_E_6 browser code ${browserCode} is agentic`
+        : `dfs_E_6 browser code ${browserCode || 'unknown'} is not agentic`,
+    },
+    {
+      position: E7_POS.EXTENSION_PRESENT,
+      dimension: 'extensionPresent',
+      expected: extensionResponded ? 99 : 0,
+      reason: extensionResponded ? 'an extension responded' : 'no extension response detected',
+    },
+    {
+      position: E7_POS.DRIVER_PRESENT,
+      dimension: 'driverPresent',
+      expected: driverReasons.length > 0 ? 99 : 0,
+      reason: driverReasons.length > 0 ? driverReasons.join(', ') : 'no driver signal detected',
+    },
+  ];
+
+  return expectations.map((expectation) => {
+    const actual = getDfsE7Score(e7ScoreTokens, expectation.position);
+    return {
+      ...expectation,
+      actual,
+      passed: actual === expectation.expected,
+    };
+  });
 }
 
 function getFingerprintValue(fingerprint, key) {
@@ -3796,17 +3942,24 @@ async function runTarget(target, config) {
     const e7 = String(initialCookieMap.dfs_E_7 || getFingerprintValue(initialFingerprint, 'dfs_E_7') || '');
     const e7Format = getDfsE7Format(e7);
     const e7ScoreTokens = decodeDfsE7ScoreTokens(e7, initialCookieMap.dfs_F_5 || getFingerprintValue(initialFingerprint, 'dfs_F_5'));
+    const e7GlobalTokenSignals = await runStep('read dfs_E_7 global token signals', () => getDfsE7GlobalTokenSignals(page));
+    const e7GlobalTokenEvaluation = buildDfsE7GlobalTokenEvaluation(e7ScoreTokens, initialCookieMap.dfs_E_6 || getFingerprintValue(initialFingerprint, 'dfs_E_6'), e7GlobalTokenSignals);
     const e7Evaluation = {
       dfs_E_7: e7,
       dfs_E_7_format: e7Format,
       dfs_E_7_score_tokens: e7ScoreTokens,
       expectedFormat: 'score-tokens',
-      expectedLengthRule: '10 + (nFields x 16) digits; 10-74 digits total; 2 decimal digits per token',
+      expectedLengthRule: '16 + (nFields x 16) digits; 16-80 digits total; 2 decimal digits per token',
       dePermutationSeedSource: 'dfs_F_5 first 8 hex characters',
+      globalTokenSignals: e7GlobalTokenSignals,
+      globalTokenEvaluation: e7GlobalTokenEvaluation,
     };
     const e7Failures = [
       ...(e7Format === 'score-tokens' ? [] : [`dfs_E_7 expected score-token format, got ${e7Format}`]),
-      ...(e7ScoreTokens.rawTokens.length >= 4 ? [] : [`dfs_E_7 expected at least 4 score tokens, got ${e7ScoreTokens.rawTokens.length}`]),
+      ...(e7ScoreTokens.rawTokens.length >= DFS_E7_GLOBAL_TOKENS ? [] : [`dfs_E_7 expected at least ${DFS_E7_GLOBAL_TOKENS} score tokens, got ${e7ScoreTokens.rawTokens.length}`]),
+      ...e7GlobalTokenEvaluation
+        .filter((entry) => !entry.passed)
+        .map((entry) => `${entry.dimension} token[${entry.position}] expected ${entry.expected}, got ${entry.actual}; ${entry.reason}`),
     ];
     const e7EvidenceFile = saveJson(path.join(outputDir, 'dfs-e7-score-token-evaluation.json'), e7Evaluation);
     addResult(
