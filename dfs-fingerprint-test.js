@@ -1911,6 +1911,34 @@ function getValueInjectionExpectation(performed = {}) {
   };
 }
 
+function getColdFocusExpectation(performed = {}) {
+  const details = performed.coldFocus || {};
+  const expected = Number(details.expectedScore || process.env.COLD_FOCUS_EXPECTED_SCORE || 50);
+  return {
+    position: E7_POS.COLD_FOCUS,
+    dimension: 'coldFocus',
+    operator: '>=',
+    expected,
+    exactish: true,
+    formula: 'PROD scores this as a proportional signal; the default two-field credential probe scores 50.',
+    fieldCount: Number(details.fieldCount || 0),
+  };
+}
+
+function getFocusNoPointerExpectation(performed = {}) {
+  const details = performed.focusNoPointer || {};
+  const positions = Array.isArray(details.expectedPositions) && details.expectedPositions.length > 0
+    ? details.expectedPositions
+    : [getDfsE7FieldTokenPosition(0, E7_FIELD.FOCUS_NO_POINTER)];
+  return {
+    anyPositions: positions,
+    dimension: 'focusNoPointer',
+    operator: '==',
+    expected: 99,
+    fieldCount: Number(details.fieldCount || positions.length || 0),
+  };
+}
+
 function getAgenticScoreExpectations(scenarioName, performed = null) {
   const field1 = (offset) => getDfsE7FieldTokenPosition(0, offset);
   const expectations = {
@@ -1918,7 +1946,7 @@ function getAgenticScoreExpectations(scenarioName, performed = null) {
     synthetic_events: [{ position: E7_POS.SYNTHETIC_EVENTS, dimension: 'syntheticEvents', operator: '>=', expected: 80 }],
     pointer_lock: [{ position: E7_POS.POINTER_LOCK, dimension: 'pointerLock', operator: '>=', expected: 60 }],
     pointer_travel: [{ position: E7_POS.POINTER_TRAVEL, dimension: 'pointerTravel', operator: '>=', expected: 50 }],
-    cold_focus: [{ position: E7_POS.COLD_FOCUS, dimension: 'coldFocus', operator: '>=', expected: 80, exactish: true }],
+    cold_focus: [getColdFocusExpectation(performed || {})],
     injected_text: [{ position: field1(E7_FIELD.INJECTED_TEXT), dimension: 'field1.injectedText', operator: '>=', expected: 90 }],
     cadence_rigidity: [{ position: field1(E7_FIELD.CADENCE_RIGIDITY), dimension: 'field1.cadenceRigidity', operator: '>=', expected: 80, tolerance: 15 }],
     human_like_cadence: [{ position: field1(E7_FIELD.CADENCE_RIGIDITY), dimension: 'field1.cadenceRigidity', operator: '<=', expected: 30, tolerance: 15 }],
@@ -1927,7 +1955,7 @@ function getAgenticScoreExpectations(scenarioName, performed = null) {
     dwell_short_holds: [{ position: field1(E7_FIELD.DWELL_ANOMALY), dimension: 'field1.dwellAnomaly', operator: '>=', expected: 80, tolerance: 15 }],
     fill_speed: [{ position: field1(E7_FIELD.FILL_SPEED), dimension: 'field1.fillSpeed', operator: '>=', expected: 85, tolerance: 15 }],
     paste_fragmentation: [{ position: field1(E7_FIELD.PASTE_FRAGMENTATION), dimension: 'field1.pasteFragmentation', operator: '>=', expected: 90 }],
-    focus_no_pointer: [{ position: field1(E7_FIELD.FOCUS_NO_POINTER), dimension: 'field1.focusNoPointer', operator: '==', expected: 99 }],
+    focus_no_pointer: [getFocusNoPointerExpectation(performed || {})],
     key_input_mismatch_cdp: [{ position: field1(E7_FIELD.KEY_INPUT_MISMATCH), dimension: 'field1.keyInputMismatch', operator: '>=', expected: 90 }],
     key_input_mismatch_paste_negative: [{ position: field1(E7_FIELD.KEY_INPUT_MISMATCH), dimension: 'field1.keyInputMismatch', operator: '==', expected: 0 }],
     human_baseline: [{ allPositions: true, dimension: 'all', operator: '<=', expected: 0, allowNoIncrease: true, excludePositions: [E7_POS.COLD_FOCUS] }],
@@ -1961,6 +1989,18 @@ function getAgenticScoreFailures(scoreState, expectations, baselineState = null)
 
   const failures = [];
   for (const expectation of expectations) {
+    if (expectation.anyPositions) {
+      const positions = expectation.anyPositions.map((position) => Number(position));
+      const scores = positions.map((position) => ({
+        position,
+        score: getDfsE7Score(scoreState, position),
+      }));
+      if (!scores.some((item) => compareScore(item.score, expectation.operator, expectation.expected, expectation.tolerance))) {
+        failures.push(`${expectation.dimension} expected any of token[${positions.join(',')}] ${expectation.operator} ${expectation.expected}${expectation.tolerance ? ` +/- ${expectation.tolerance}` : ''}, got ${scores.map((item) => `token[${item.position}]=${item.score}`).join(', ')}`);
+      }
+      continue;
+    }
+
     if (expectation.allPositions) {
       const excludedPositions = new Set((expectation.excludePositions || []).map((position) => Number(position)));
       scoreState.scores.forEach((score, position) => {
@@ -2226,6 +2266,15 @@ async function getScenarioFieldSelectors(page, root, config, minimumCount = 1) {
     selectors.push(...await ensureAgenticScratchFields(page, root, minimumCount - selectors.length));
   }
   return selectors;
+}
+
+function getConfiguredScenarioFieldSelectors(config, minimumCount = 1) {
+  const selectors = [config.usernameSelector, config.passwordSelector].filter(Boolean);
+  return {
+    selectors: selectors.slice(0, Math.max(1, Number(minimumCount))),
+    availableCount: selectors.length,
+    minimumCount: Number(minimumCount),
+  };
 }
 
 async function getValueInjectionFieldTargets(page, root, minimumCount = 1) {
@@ -3106,7 +3155,16 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       break;
     }
     case 'cold_focus': {
-      const selectors = await getScenarioFieldSelectors(page, root, config, 3);
+      const minimumCount = Number(process.env.COLD_FOCUS_FIELD_COUNT || 2);
+      const fieldTargets = getConfiguredScenarioFieldSelectors(config, minimumCount);
+      if (fieldTargets.availableCount < minimumCount) {
+        return {
+          skipped: true,
+          reason: `cold_focus requires ${minimumCount} configured credential fields; found ${fieldTargets.availableCount}.`,
+          availableSelectors: fieldTargets.selectors,
+        };
+      }
+      const selectors = fieldTargets.selectors;
       const focused = [];
       for (let index = 0; index < selectors.length; index += 1) {
         const selector = selectors[index];
@@ -3122,8 +3180,9 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
         focused,
         expectedToken: 'coldFocus',
         expectedPosition: E7_POS.COLD_FOCUS,
+        expectedScore: Number(process.env.COLD_FOCUS_EXPECTED_SCORE || 50),
       };
-      triggerOptions.forceSyntheticSubmit = false;
+      triggerOptions.forceSyntheticSubmit = readBoolean('COLD_FOCUS_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
     case 'synthetic_events': {
@@ -3269,13 +3328,37 @@ async function performInteractionScenario(page, scenarioName, target = {}) {
       triggerOptions.forceSyntheticSubmit = readBoolean('PASTE_FRAGMENTATION_FORCE_SYNTHETIC_SUBMIT', true);
       break;
     }
-    case 'focus_no_pointer':
-      scenarioDetails.focusNoPointer = await programmaticFocusField(root.locator(config.usernameSelector));
-      await page.keyboard.type(String(username), { delay: Number(process.env.FOCUS_NO_POINTER_TYPE_DELAY_MS || 60) });
-      scenarioDetails.focusNoPointer.expectedToken = 'field1.focusNoPointer';
-      scenarioDetails.focusNoPointer.expectedPosition = getDfsE7FieldTokenPosition(0, E7_FIELD.FOCUS_NO_POINTER);
-      triggerOptions.forceSyntheticSubmit = false;
+    case 'focus_no_pointer': {
+      const minimumCount = Number(process.env.FOCUS_NO_POINTER_FIELD_COUNT || 2);
+      const fieldTargets = getConfiguredScenarioFieldSelectors(config, minimumCount);
+      if (fieldTargets.availableCount < minimumCount) {
+        return {
+          skipped: true,
+          reason: `focus_no_pointer requires ${minimumCount} configured credential fields; found ${fieldTargets.availableCount}.`,
+          availableSelectors: fieldTargets.selectors,
+        };
+      }
+      const selectors = fieldTargets.selectors;
+      const focused = [];
+      for (let index = 0; index < selectors.length; index += 1) {
+        const selector = selectors[index];
+        const field = root.locator(selector);
+        focused.push({
+          selector,
+          focus: await programmaticFocusField(field),
+          expectedPosition: getDfsE7FieldTokenPosition(index, E7_FIELD.FOCUS_NO_POINTER),
+        });
+        await page.keyboard.type(`${username}${index}`, { delay: Number(process.env.FOCUS_NO_POINTER_TYPE_DELAY_MS || 60) });
+      }
+      scenarioDetails.focusNoPointer = {
+        fieldCount: selectors.length,
+        focused,
+        expectedToken: 'field*.focusNoPointer',
+        expectedPositions: focused.map((item) => item.expectedPosition),
+      };
+      triggerOptions.forceSyntheticSubmit = readBoolean('FOCUS_NO_POINTER_FORCE_SYNTHETIC_SUBMIT', true);
       break;
+    }
     case 'key_input_mismatch_cdp':
       if (!supportsCdpInsertText(target)) {
         return {

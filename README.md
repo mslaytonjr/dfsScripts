@@ -196,7 +196,7 @@ value_injection        direct el.value assignment on scenario fields; token[0] ~
 synthetic_events       dispatch untrusted input/change events; token[1] >= 80
 pointer_lock           center-click 5+ controls; token[2] >= 60
 pointer_travel         click targets without intermediate mousemove path; token[3] >= 50
-cold_focus             programmatic focus on 3+ fields; token[4] >= 80
+cold_focus             programmatic focus on configured credential fields only; token[4] >= 50 by default
 injected_text          direct username value assignment; token[5] >= 90
 paste_fragmentation    4 paste-shaped insertFromPaste chunks in one field; token[6] >= 90
 cadence_rigidity       fixed 50ms username typing; token[7] >= 80
@@ -205,7 +205,7 @@ focus_anomaly          input event before focus; token[8] >= 90
 dwell_missing_keyups   repeated keydown events without keyup; token[9] >= 90
 dwell_short_holds      immediate keydown/keyup pairs; token[9] >= 80
 fill_speed             5ms/char password typing; token[10] >= 85
-focus_no_pointer       programmatic focus then type; token[11] = 99
+focus_no_pointer       programmatic focus then type across configured credential fields only; any focusNoPointer field token = 99
 key_input_mismatch_cdp CDP Input.insertText without keydowns; token[12] >= 90; Chromium only
 key_input_mismatch_paste_negative paste-style insert should not fire mismatch; token[12] = 0
 human_baseline         random cadence and non-navigating offset click by default; non-coldFocus tokens <= 0 or unchanged from baseline
