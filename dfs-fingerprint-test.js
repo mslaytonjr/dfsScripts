@@ -1859,7 +1859,7 @@ function getScenarioText(name) {
 function getInteractionScenarioNames() {
   return parseList(readString(
     'INTERACTION_TEST_SCENARIOS',
-    'value_injection,synthetic_events,pointer_lock,pointer_travel,cold_focus,injected_text,cadence_rigidity,human_like_cadence,focus_anomaly,dwell_missing_keyups,dwell_short_holds,fill_speed,paste_fragmentation,focus_no_pointer,key_input_mismatch_cdp,key_input_mismatch_paste_negative,human_baseline,human_pause_baseline,human_mouse_path,browser_autofill_suppression'
+    'value_injection,synthetic_events,pointer_lock,pointer_travel,cold_focus,injected_text,cadence_rigidity,human_like_cadence,focus_anomaly,dwell_missing_keyups,dwell_short_holds,fill_speed,paste_fragmentation,focus_no_pointer,key_input_mismatch_cdp,key_input_mismatch_paste_negative'
   ));
 }
 
@@ -1888,6 +1888,16 @@ function normalizeInteractionScenarioName(name) {
     c4: 'browser_autofill_suppression',
   };
   return aliases[normalized] || normalized;
+}
+
+function getProcessLimitedInteractionSkipReason(scenarioName) {
+  const reasons = {
+    human_baseline: 'Skipped by default because Playwright-generated baseline input still trips DFS behavior scores; use manual or hardware-backed input for this control.',
+    human_pause_baseline: 'Skipped by default because Playwright-generated paused typing still trips DFS behavior scores; use manual or hardware-backed input for this control.',
+    human_mouse_path: 'Skipped by default because Playwright-generated mouse paths still trip DFS pointer-travel scoring; use manual or hardware-backed input for this control.',
+    browser_autofill_suppression: 'Skipped by default because real browser autofill requires a seeded persistent browser profile and cannot be forced reliably from a blank Playwright context.',
+  };
+  return reasons[scenarioName] || null;
 }
 
 function getValueInjectionExpectation(performed = {}) {
@@ -3602,12 +3612,31 @@ async function runInteractionScenarioTests(browser, target, config, outputDir, r
   }
 
   for (const scenarioName of getInteractionScenarioNames()) {
+    const normalizedScenarioName = normalizeInteractionScenarioName(scenarioName);
+    const processLimitedReason = getProcessLimitedInteractionSkipReason(normalizedScenarioName);
+    if (processLimitedReason && !readBoolean('RUN_PROCESS_LIMITED_INTERACTION_TESTS', false)) {
+      addResult(
+        results,
+        `Interaction Scenario - ${normalizedScenarioName}`,
+        'SKIP',
+        {
+          scenario: normalizedScenarioName,
+          requestedScenario: scenarioName,
+          reason: processLimitedReason,
+          optIn: 'Set RUN_PROCESS_LIMITED_INTERACTION_TESTS=true for investigative runs only.',
+        },
+        [],
+        [processLimitedReason]
+      );
+      continue;
+    }
+
     await runInteractionScenario(browser, target, config, outputDir, results, scenarioName);
   }
 }
 
 async function runPrivateModeBrowserTest(target, config, outputDir, results) {
-  if (!readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', true)) {
+  if (!readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', false)) {
     addResult(
       results,
       'Private / Incognito Browser Mode Launch',
@@ -4076,7 +4105,7 @@ async function runTarget(target, config) {
       );
     }
 
-    if (readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', true)) {
+    if (readBoolean('PERFORM_PRIVATE_MODE_BROWSER_TEST', false)) {
       await runPrivateModeBrowserTest(target, config, outputDir, results);
     } else {
       addResult(

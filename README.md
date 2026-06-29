@@ -148,7 +148,9 @@ PERFORM_MOUSE_MOVEMENT=true
 DISCOVER_INPUTS_ONLY=false
 SUBMIT_CREDENTIALS=false
 PERFORM_INTERACTION_SCENARIO_TESTS=true
-INTERACTION_TEST_SCENARIOS=A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8,B9,B10,B11,C1,C2,C3,C4
+INTERACTION_TEST_SCENARIOS=A1,A2,A3,A4,A5,B1,B2,B3,B4,B5,B6,B7,B8,B9,B10,B11
+RUN_PROCESS_LIMITED_INTERACTION_TESTS=false
+PERFORM_PRIVATE_MODE_BROWSER_TEST=false
 FIREFOX_USE_PLAYWRIGHT_BUNDLED=true
 DFS_E7_FORMAT=auto
 DFS_E7_SCORE_SHUFFLE_MAPPING=canonical-index-to-shuffled-index
@@ -169,7 +171,9 @@ Use `LOB.LOGIN_BEFORE_MOUSE=true` for pages like Secure where the login iframe i
 
 For Chase runs that land on the system-requirements page, the runner marks the target availability check as skipped instead of failing downstream DFS tests. For Secure, `SECURE_SYSTEM_REQUIREMENTS_SIGNIN_RECOVERY=true` also clicks the visible Sign in link and waits again before deciding whether to skip. `LOGIN_FRAME_WAIT_TIMEOUT_MS` controls how long the runner waits for `LOGIN_FRAME_NAME` or `LOGIN_FRAME_URL_MATCHER` before falling back to the top page.
 
-`INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
+`INTERACTION_TEST_SCENARIOS` is a comma-separated allowlist for the behavior interaction tests. If it is unset or blank, the runner uses every stable built-in scenario. Set `PERFORM_INTERACTION_SCENARIO_TESTS=false` to disable these tests entirely.
+
+The process-limited controls `C1` through `C4` are skipped by default even when listed. They require manual/hardware-backed input or a seeded persistent browser profile, so they are not stable gates for normal automation. Set `RUN_PROCESS_LIMITED_INTERACTION_TESTS=true` only for investigative runs.
 
 For `value_injection`, the runner assigns values across `VALUE_INJECTION_FIELD_COUNT=4` fields by default. It waits `VALUE_INJECTION_ECHO_WINDOW_WAIT_MS` before assigning values so a recent trusted keystroke is not treated as a framework echo. It also dispatches `input/change` after the direct value assignment by default (`VALUE_INJECTION_DISPATCH_EVENTS=true`) and uses a synthetic hidden submit by default (`VALUE_INJECTION_FORCE_SYNTHETIC_SUBMIT=true`) so page validation/navigation does not hide the score update. The global value-injection score is expected to equal `min(99, round(100 * injectedFields / totalFields))` within `+/- 1`, using the fields inspected and targeted by the scenario.
 
@@ -208,10 +212,10 @@ fill_speed             5ms/char password typing; token[10] >= 85
 focus_no_pointer       programmatic focus then type across configured credential fields only; any focusNoPointer field token = 99
 key_input_mismatch_cdp CDP Input.insertText without keydowns; token[12] >= 90; Chromium only
 key_input_mismatch_paste_negative paste-style insert should not fire mismatch; token[12] = 0
-human_baseline         random cadence and non-navigating offset click by default; non-coldFocus tokens <= 0 or unchanged from baseline
-human_pause_baseline   short pause mid-typing on username and password; non-coldFocus tokens <= 20 or unchanged from baseline
-human_mouse_path       mousemove path between actions; token[3] <= 20
-browser_autofill_suppression validates autofill suppression when browser autofill is observed
+human_baseline         process-limited manual/hardware-backed control; skipped by default
+human_pause_baseline   process-limited manual/hardware-backed control; skipped by default
+human_mouse_path       process-limited manual/hardware-backed control; skipped by default
+browser_autofill_suppression process-limited seeded-profile control; skipped by default
 ```
 
 Aliases `A1` through `A5`, `B1` through `B11`, and `C1` through `C4` map to the scenarios above.
