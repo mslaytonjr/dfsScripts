@@ -204,8 +204,17 @@ async function runWithTimeout(label, timeoutMs, action) {
   }
 }
 
+async function getFingerprintTarget(pageOrFrame) {
+  if (pageOrFrame && typeof pageOrFrame.frames === 'function') {
+    const frame = await waitForLoginFrame(pageOrFrame, Number(process.env.LOGIN_FRAME_WAIT_TIMEOUT_MS || process.env.FIELD_TIMEOUT_MS || 45000));
+    if (frame) return frame;
+  }
+  return pageOrFrame;
+}
+
 async function readFingerprintNow(page) {
-  return page.evaluate(() => {
+  const target = await getFingerprintTarget(page);
+  return target.evaluate(() => {
     const data = window.FingerprintData;
     if (!data) {
       return { __error: 'window.FingerprintData is not defined' };
@@ -228,7 +237,8 @@ async function readFingerprintNow(page) {
 
 async function waitForFingerprintData(page, timeout = Number(process.env.FINGERPRINT_DATA_WAIT_TIMEOUT_MS || 15000)) {
   try {
-    await page.waitForFunction(
+    const target = await getFingerprintTarget(page);
+    await target.waitForFunction(
       () => {
         const data = window.FingerprintData;
         return Boolean(
@@ -304,11 +314,13 @@ async function waitForDfsE7Value(page, context, timeout = Number(process.env.DFS
 }
 
 async function getDfsCookies(page) {
-  return page.evaluate(() => document.cookie.split(';').map((cookie) => cookie.trim()).filter((cookie) => cookie.startsWith('dfs_')));
+  const target = await getFingerprintTarget(page);
+  return target.evaluate(() => document.cookie.split(';').map((cookie) => cookie.trim()).filter((cookie) => cookie.startsWith('dfs_')));
 }
 
 async function waitForDfsCookie(page, cookieName, timeout = Number(process.env.COOKIE_WAIT_TIMEOUT_MS || 15000)) {
-  await page.waitForFunction(
+  const target = await getFingerprintTarget(page);
+  await target.waitForFunction(
     (name) => document.cookie.split(';').map((cookie) => cookie.trim()).some((cookie) => cookie.startsWith(`${name}=`)),
     cookieName,
     { timeout }
@@ -316,7 +328,8 @@ async function waitForDfsCookie(page, cookieName, timeout = Number(process.env.C
 }
 
 async function waitForDfsFingerprintValue(page, key, timeout = Number(process.env.FINGERPRINT_WAIT_TIMEOUT_MS || 15000)) {
-  await page.waitForFunction(
+  const target = await getFingerprintTarget(page);
+  await target.waitForFunction(
     (fingerprintKey) => {
       const data = window.FingerprintData;
       const getter =
