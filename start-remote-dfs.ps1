@@ -2,9 +2,15 @@ param(
     [string]$Browsers = "",
     [string]$Lobs = "",
     [string]$ReleaseVersion = "",
+    [string]$ExpectedDfsE8 = "",
+    [string]$ChromeVersions = "150.0.7871.115,151.0.7922.47,151.0.7922.76,152.0.7977.65,152.0.7977.76,152.0.7977.83,152.0.7977.199,153.0.8010.37",
+    [string]$InstallBrowserTargets = "chrome",
     [switch]$Sync,
     [switch]$Autostash,
     [switch]$InstallBrowsers,
+    [switch]$UpdateChromeVersions,
+    [switch]$UpdateEnv,
+    [switch]$Qa2Defaults,
     [switch]$SkipInteractionScenarios,
     [switch]$Headless,
     [string]$LogRoot = "logs\remote-runs"
@@ -19,6 +25,14 @@ if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
 
 Set-Location $repoRoot
 
+if ($Qa2Defaults) {
+    if (-not $ReleaseVersion) { $ReleaseVersion = "132.0.0-beta.1-QA-2" }
+    if (-not $ExpectedDfsE8) { $ExpectedDfsE8 = "11.0.0-beta.1,132.0.0-beta.1" }
+    $UpdateChromeVersions = $true
+    $UpdateEnv = $true
+    $InstallBrowsers = $true
+}
+
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logDir = Join-Path $repoRoot $LogRoot
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -29,6 +43,7 @@ $envLines = [System.Collections.Generic.List[string]]::new()
 if ($Browsers) { $envLines.Add("`$env:BROWSERS = '$($Browsers.Replace("'", "''"))'") }
 if ($Lobs) { $envLines.Add("`$env:LOBS = '$($Lobs.Replace("'", "''"))'") }
 if ($ReleaseVersion) { $envLines.Add("`$env:RELEASE_VERSION = '$($ReleaseVersion.Replace("'", "''"))'") }
+if ($ExpectedDfsE8) { $envLines.Add("`$env:EXPECTED_DFS_E_8 = '$($ExpectedDfsE8.Replace("'", "''"))'") }
 if ($SkipInteractionScenarios) { $envLines.Add("`$env:PERFORM_INTERACTION_SCENARIO_TESTS = 'false'") }
 if ($Headless) { $envLines.Add("`$env:HEADLESS = 'true'") }
 
@@ -47,11 +62,68 @@ if ($Sync) {
 "@
 }
 
-if ($InstallBrowsers) {
-    $installerBrowsers = if ($Browsers) { $Browsers } else { "chrome,opera" }
+if ($UpdateChromeVersions) {
+    $escapedChromeVersions = $ChromeVersions.Replace("'", "''")
     $childScript += @"
 
-    powershell -NoProfile -ExecutionPolicy Bypass -File .\browser-installer\download-browsers.ps1 -Browsers '$($installerBrowsers.Replace("'", "''"))'
+    `$versionsPath = Join-Path `$PWD 'browser-installer\versions.json'
+    `$config = Get-Content -Raw `$versionsPath | ConvertFrom-Json
+    `$existing = @(`$config.browsers.chrome)
+    `$merged = [System.Collections.Generic.List[string]]::new()
+    foreach (`$version in `$existing) {
+        if (`$merged -notcontains [string]`$version) { `$merged.Add([string]`$version) }
+    }
+    `$newVersions = '$escapedChromeVersions'.Split(',') | ForEach-Object { `$_.Trim() } | Where-Object { `$_ }
+    foreach (`$version in `$newVersions) {
+        if (`$merged -notcontains `$version) { `$merged.Add(`$version) }
+    }
+    `$config.browsers.chrome = `$merged.ToArray()
+    `$config | ConvertTo-Json -Depth 20 | Set-Content -Path `$versionsPath -Encoding UTF8
+"@
+}
+
+if ($UpdateEnv) {
+    $envUpdates = [System.Collections.Generic.List[string]]::new()
+    if ($Browsers) { $envUpdates.Add("@{ Key = 'BROWSERS'; Value = '$($Browsers.Replace("'", "''"))' }") }
+    if ($Lobs) { $envUpdates.Add("@{ Key = 'LOBS'; Value = '$($Lobs.Replace("'", "''"))' }") }
+    if ($ReleaseVersion) { $envUpdates.Add("@{ Key = 'RELEASE_VERSION'; Value = '$($ReleaseVersion.Replace("'", "''"))' }") }
+    if ($ExpectedDfsE8) { $envUpdates.Add("@{ Key = 'EXPECTED_DFS_E_8'; Value = '$($ExpectedDfsE8.Replace("'", "''"))' }") }
+    if ($SkipInteractionScenarios) { $envUpdates.Add("@{ Key = 'PERFORM_INTERACTION_SCENARIO_TESTS'; Value = 'false' }") }
+    if ($Headless) { $envUpdates.Add("@{ Key = 'HEADLESS'; Value = 'true' }") }
+    if ($envUpdates.Count -gt 0) {
+        $childScript += @"
+
+    `$envPath = Join-Path `$PWD '.env'
+    `$updates = @(
+        $($envUpdates -join ",`n        ")
+    )
+    `$lines = [System.Collections.Generic.List[string]]::new()
+    if (Test-Path `$envPath) {
+        foreach (`$line in Get-Content `$envPath) { [void]`$lines.Add(`$line) }
+    }
+    foreach (`$update in `$updates) {
+        `$pattern = "^\s*`$([regex]::Escape(`$update.Key))\s*="
+        `$found = `$false
+        for (`$i = 0; `$i -lt `$lines.Count; `$i++) {
+            if (`$lines[`$i] -match `$pattern) {
+                `$lines[`$i] = "`$(`$update.Key)=`$(`$update.Value)"
+                `$found = `$true
+                break
+            }
+        }
+        if (-not `$found) { `$lines.Add("`$(`$update.Key)=`$(`$update.Value)") }
+    }
+    Set-Content -Path `$envPath -Value `$lines -Encoding UTF8
+"@
+    }
+}
+
+if ($InstallBrowsers) {
+    $installerBrowsers = $InstallBrowserTargets
+    $childScript += @"
+
+    `$installerBrowserTargets = '$($installerBrowsers.Replace("'", "''"))'.Split(',') | ForEach-Object { `$_.Trim() } | Where-Object { `$_ }
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\browser-installer\download-browsers.ps1 -Browsers `$installerBrowserTargets
 "@
 }
 
