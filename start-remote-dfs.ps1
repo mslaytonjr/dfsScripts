@@ -15,10 +15,28 @@ param(
     [switch]$Qa2Defaults,
     [switch]$SkipInteractionScenarios,
     [switch]$Headless,
+    [switch]$Help,
     [string]$LogRoot = "logs\remote-runs"
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($Help) {
+    @"
+Usage:
+  .\start-remote-dfs.ps1 -Qa2Defaults -Sync -Autostash -Browsers chrome,comet -Lobs PUBLIC,SECURE -SkipInteractionScenarios
+
+Options:
+  -Qa2Defaults              Set QA2 release/env defaults, update Chrome versions, install Chrome first.
+  -Browsers <list>          Browser keys to run in dfs-fingerprint-test.js, such as chrome,comet.
+  -Lobs <list>              LOB list to run, such as PUBLIC,SECURE.
+  -InstallBrowserTargets    Downloadable browser targets for browser-installer, default chrome.
+  -UpdateEnv                Persist selected values into .env.
+  -UpdateChromeVersions     Merge the configured Chromium version list into versions.json.
+  -Sync -Autostash          Pull latest git changes before the run.
+"@
+    exit 0
+}
 
 $repoRoot = (& git rev-parse --show-toplevel 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $repoRoot) {
