@@ -3,6 +3,8 @@ param(
     [string]$Lobs = "",
     [string]$ReleaseVersion = "",
     [string]$ExpectedDfsE8 = "",
+    [string]$PublicTargetUrl = "",
+    [string]$SecureTargetUrl = "",
     [string]$ChromeVersions = "150.0.7871.115,151.0.7922.47,151.0.7922.76,152.0.7977.65,152.0.7977.76,152.0.7977.83,152.0.7977.199,153.0.8010.37",
     [string]$InstallBrowserTargets = "chrome",
     [switch]$Sync,
@@ -28,6 +30,8 @@ Set-Location $repoRoot
 if ($Qa2Defaults) {
     if (-not $ReleaseVersion) { $ReleaseVersion = "132.0.0-beta.1-QA-2" }
     if (-not $ExpectedDfsE8) { $ExpectedDfsE8 = "11.0.0-beta.1,132.0.0-beta.1" }
+    if (-not $PublicTargetUrl) { $PublicTargetUrl = "https://wwwqa3.chase.com" }
+    if (-not $SecureTargetUrl) { $SecureTargetUrl = "https://qac2-secure01ea.chase.com" }
     $UpdateChromeVersions = $true
     $UpdateEnv = $true
     $InstallBrowsers = $true
@@ -44,6 +48,8 @@ if ($Browsers) { $envLines.Add("`$env:BROWSERS = '$($Browsers.Replace("'", "''")
 if ($Lobs) { $envLines.Add("`$env:LOBS = '$($Lobs.Replace("'", "''"))'") }
 if ($ReleaseVersion) { $envLines.Add("`$env:RELEASE_VERSION = '$($ReleaseVersion.Replace("'", "''"))'") }
 if ($ExpectedDfsE8) { $envLines.Add("`$env:EXPECTED_DFS_E_8 = '$($ExpectedDfsE8.Replace("'", "''"))'") }
+if ($PublicTargetUrl) { $envLines.Add("[Environment]::SetEnvironmentVariable('PUBLIC.TARGET_URL', '$($PublicTargetUrl.Replace("'", "''"))', 'Process')") }
+if ($SecureTargetUrl) { $envLines.Add("[Environment]::SetEnvironmentVariable('SECURE.TARGET_URL', '$($SecureTargetUrl.Replace("'", "''"))', 'Process')") }
 if ($SkipInteractionScenarios) { $envLines.Add("`$env:PERFORM_INTERACTION_SCENARIO_TESTS = 'false'") }
 if ($Headless) { $envLines.Add("`$env:HEADLESS = 'true'") }
 
@@ -88,6 +94,8 @@ if ($UpdateEnv) {
     if ($Lobs) { $envUpdates.Add("@{ Key = 'LOBS'; Value = '$($Lobs.Replace("'", "''"))' }") }
     if ($ReleaseVersion) { $envUpdates.Add("@{ Key = 'RELEASE_VERSION'; Value = '$($ReleaseVersion.Replace("'", "''"))' }") }
     if ($ExpectedDfsE8) { $envUpdates.Add("@{ Key = 'EXPECTED_DFS_E_8'; Value = '$($ExpectedDfsE8.Replace("'", "''"))' }") }
+    if ($PublicTargetUrl) { $envUpdates.Add("@{ Key = 'PUBLIC.TARGET_URL'; Value = '$($PublicTargetUrl.Replace("'", "''"))' }") }
+    if ($SecureTargetUrl) { $envUpdates.Add("@{ Key = 'SECURE.TARGET_URL'; Value = '$($SecureTargetUrl.Replace("'", "''"))' }") }
     if ($SkipInteractionScenarios) { $envUpdates.Add("@{ Key = 'PERFORM_INTERACTION_SCENARIO_TESTS'; Value = 'false' }") }
     if ($Headless) { $envUpdates.Add("@{ Key = 'HEADLESS'; Value = 'true' }") }
     if ($envUpdates.Count -gt 0) {

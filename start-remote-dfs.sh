@@ -5,6 +5,8 @@ browsers=""
 lobs=""
 release_version=""
 expected_dfs_e8=""
+public_target_url=""
+secure_target_url=""
 chrome_versions="150.0.7871.115,151.0.7922.47,151.0.7922.76,152.0.7977.65,152.0.7977.76,152.0.7977.83,152.0.7977.199,153.0.8010.37"
 install_browser_targets="chrome"
 sync_repo=""
@@ -33,6 +35,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --expected-dfs-e8)
             expected_dfs_e8="$2"
+            shift 2
+            ;;
+        --public-target-url)
+            public_target_url="$2"
+            shift 2
+            ;;
+        --secure-target-url)
+            secure_target_url="$2"
             shift 2
             ;;
         --chrome-versions)
@@ -93,6 +103,8 @@ done
 if [[ -n "$qa2_defaults" ]]; then
     [[ -z "$release_version" ]] && release_version="132.0.0-beta.1-QA-2"
     [[ -z "$expected_dfs_e8" ]] && expected_dfs_e8="11.0.0-beta.1,132.0.0-beta.1"
+    [[ -z "$public_target_url" ]] && public_target_url="https://wwwqa3.chase.com"
+    [[ -z "$secure_target_url" ]] && secure_target_url="https://qac2-secure01ea.chase.com"
     update_chrome_versions=1
     update_env=1
     install_browsers=1
@@ -146,19 +158,23 @@ update_env_value() {
     touch "$env_path"
     local tmp_env
     tmp_env="$(mktemp)"
-    if grep -Eq "^[[:space:]]*$key[[:space:]]*=" "$env_path"; then
-        awk -v key="$key" -v value="$value" '
-            $0 ~ "^[[:space:]]*" key "[[:space:]]*=" && !done {
+    awk -v key="$key" -v value="$value" '
+        BEGIN { done=0 }
+        {
+            split($0, parts, "=")
+            line_key=parts[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", line_key)
+            if (line_key == key && !done) {
                 print key "=" value
                 done=1
                 next
             }
-            { print }
-        ' "$env_path" > "$tmp_env"
-    else
-        cat "$env_path" > "$tmp_env"
-        printf '%s=%s\n' "$key" "$value" >> "$tmp_env"
-    fi
+            print
+        }
+        END {
+            if (!done) print key "=" value
+        }
+    ' "$env_path" > "$tmp_env"
     mv "$tmp_env" "$env_path"
 }
 SCRIPT
@@ -166,6 +182,8 @@ SCRIPT
         [[ -n "$lobs" ]] && printf 'update_env_value LOBS %q\n' "$lobs"
         [[ -n "$release_version" ]] && printf 'update_env_value RELEASE_VERSION %q\n' "$release_version"
         [[ -n "$expected_dfs_e8" ]] && printf 'update_env_value EXPECTED_DFS_E_8 %q\n' "$expected_dfs_e8"
+        [[ -n "$public_target_url" ]] && printf 'update_env_value PUBLIC.TARGET_URL %q\n' "$public_target_url"
+        [[ -n "$secure_target_url" ]] && printf 'update_env_value SECURE.TARGET_URL %q\n' "$secure_target_url"
         [[ -n "$skip_interactions" ]] && echo 'update_env_value PERFORM_INTERACTION_SCENARIO_TESTS false'
         [[ -n "$headless" ]] && echo 'update_env_value HEADLESS true'
     fi
@@ -182,7 +200,14 @@ SCRIPT
     [[ -n "$skip_interactions" ]] && echo 'export PERFORM_INTERACTION_SCENARIO_TESTS=false'
     [[ -n "$headless" ]] && echo 'export HEADLESS=true'
 
-    echo 'npm run dfs:test'
+    if [[ -n "$public_target_url" || -n "$secure_target_url" ]]; then
+        printf 'env'
+        [[ -n "$public_target_url" ]] && printf ' %q' "PUBLIC.TARGET_URL=$public_target_url"
+        [[ -n "$secure_target_url" ]] && printf ' %q' "SECURE.TARGET_URL=$secure_target_url"
+        printf ' npm run dfs:test\n'
+    else
+        echo 'npm run dfs:test'
+    fi
 } > "$run_script"
 
 chmod +x "$run_script"
