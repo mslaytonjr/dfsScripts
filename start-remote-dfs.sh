@@ -140,12 +140,26 @@ run_script="$log_dir/dfs-$timestamp-run.sh"
         printf 'chrome_versions=%q\n' "$chrome_versions"
         cat <<'SCRIPT'
 versions_path="browser-installer/versions.json"
-tmp_versions="$(mktemp)"
-jq --arg versions "$chrome_versions" '
-  ($versions | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $newVersions
-  | .browsers.chrome = reduce (.browsers.chrome + $newVersions)[] as $version ([]; if index($version) then . else . + [$version] end)
-' "$versions_path" > "$tmp_versions"
-mv "$tmp_versions" "$versions_path"
+node - "$versions_path" "$chrome_versions" <<'NODE'
+const fs = require('fs');
+const [versionsPath, rawVersions] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(versionsPath, 'utf8'));
+const existing = Array.isArray(config.browsers && config.browsers.chrome)
+  ? config.browsers.chrome.map(String)
+  : [];
+const additions = String(rawVersions || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const seen = new Set();
+config.browsers = config.browsers || {};
+config.browsers.chrome = [...existing, ...additions].filter((version) => {
+  if (seen.has(version)) return false;
+  seen.add(version);
+  return true;
+});
+fs.writeFileSync(versionsPath, `${JSON.stringify(config, null, 2)}\n`);
+NODE
 SCRIPT
     fi
 
