@@ -2,6 +2,8 @@
 
 Browser download and DFS fingerprint evidence testing scripts.
 
+For step-by-step instructions in plain language, read the [User Guide](USER_GUIDE.md). It covers setup, testing, reports, browser comparison, background runs, and troubleshooting.
+
 ## Supported Workflow
 
 This repo currently has two primary jobs:
